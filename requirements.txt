@@ -1,1 +1,5 @@
 Flask>=3.0
+gunicorn>=22.0
+argon2-cffi>=23.1
+Flask-Limiter>=3.5
+Pillow>=10.0

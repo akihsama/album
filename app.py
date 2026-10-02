@@ -1,7 +1,10 @@
+import logging
 import os
 import uuid
 import secrets
+from datetime import timedelta
 from functools import wraps
+
 from flask import (
     Flask,
     request,
@@ -12,32 +15,73 @@ from flask import (
     send_from_directory,
     session,
     abort,
-    safe_join,
 )
 from werkzeug.utils import secure_filename
+from werkzeug.middleware.proxy_fix import ProxyFix
+from argon2 import PasswordHasher
+from argon2.exceptions import InvalidHash, VerificationError, VerifyMismatchError
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 
-# ----- 配置 -----
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("album")
+
+
+# ----- 配置：关键项缺失就拒绝启动，绝不静默降级 -----
 UPLOAD_FOLDER = os.environ.get("UPLOAD_FOLDER", "uploads")
 ALLOWED_EXTENSIONS = {"txt", "pdf", "png", "jpg", "jpeg", "gif", "zip", "csv"}
 IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "gif"}
-MAX_CONTENT_LENGTH = int(os.environ.get("MAX_CONTENT_LENGTH", 16 * 1024 * 1024))
-PASSWORD = os.environ.get("PASSWORD", "changeme")
-SECRET_KEY = os.environ.get("SECRET_KEY", secrets.token_urlsafe(32))
-ENABLE_SSL = os.environ.get("ENABLE_SSL", "0") == "1"
+# 默认与 nginx 的 client_max_body_size 50M 对齐，避免"收完了才被拒"
+MAX_CONTENT_LENGTH = int(os.environ.get("MAX_CONTENT_LENGTH", 50 * 1024 * 1024))
+
+SECRET_KEY = os.environ.get("SECRET_KEY")
+if not SECRET_KEY:
+    raise SystemExit("必须设置 SECRET_KEY（生成：openssl rand -hex 32）")
+
+PASSWORD_HASH = os.environ.get("PASSWORD_HASH")
+if not PASSWORD_HASH:
+    raise SystemExit("必须设置 PASSWORD_HASH（生成：python scripts/init_password.py）")
+
+# 反向代理已终结 TLS 时为 1；本地 http 调试设 BEHIND_TLS=0
+BEHIND_TLS = os.environ.get("BEHIND_TLS", "1") == "1"
+SESSION_LIFETIME_DAYS = int(os.environ.get("SESSION_LIFETIME_DAYS", "7"))
 
 app = Flask(__name__)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
 app.secret_key = SECRET_KEY
-# Security-related cookie settings (effective when behind TLS)
+
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=SESSION_LIFETIME_DAYS)
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
-app.config["SESSION_COOKIE_SECURE"] = True  # requires TLS in production
+app.config["SESSION_COOKIE_SECURE"] = BEHIND_TLS   # 只在 TLS 下发送 cookie
+
+# 让 Flask 识别真实协议与来源 IP（否则限流拿到的全是 nginx 的内网 IP）
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+
+# 注意：memory:// 在多 worker 下是"每进程各算一份"，4 worker 等于配额放大 4 倍。
+# 单用户场景够用；要严格限流改成 storage_uri="redis://redis:6379"
+limiter = Limiter(
+    key_func=get_remote_address,
+    app=app,
+    default_limits=["600/hour"],
+    storage_uri=os.environ.get("LIMITER_STORAGE", "memory://"),
+)
 
 os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
 
+_ph = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=4)
+
 
 # ----- 工具函数 -----
+def verify_password(pwd: str) -> bool:
+    """Argon2id 校验。慢哈希，抗 GPU/ASIC 爆破。"""
+    try:
+        return _ph.verify(PASSWORD_HASH, pwd)
+    except (VerifyMismatchError, VerificationError, InvalidHash):
+        return False
+
+
 def allowed_file(filename):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
@@ -62,6 +106,14 @@ def ensure_csrf():
     return session["csrf_token"]
 
 
+@app.after_request
+def security_headers(resp):
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    return resp
+
+
 # ----- 路由 -----
 @app.route("/", methods=["GET"])
 def index():
@@ -70,6 +122,7 @@ def index():
 
 
 @app.route("/upload", methods=["POST"])
+@limiter.limit("60/minute")
 def upload():
     # Optional CSRF check even for anonymous uploads
     form_csrf = request.form.get("csrf_token")
@@ -102,15 +155,21 @@ def upload():
 
 
 @app.route("/login", methods=["GET", "POST"])
+@limiter.limit("10/minute", methods=["POST"])
 def login():
     next_url = request.args.get("next") or url_for("protected")
     if request.method == "POST":
         pwd = request.form.get("password", "")
-        if pwd == PASSWORD:
+        if verify_password(pwd):
+            # 登录成功必须重建会话，防会话固定
+            session.clear()
             session["auth"] = True
+            session.permanent = True
             ensure_csrf()
+            log.info("登录成功 ip=%s", request.remote_addr)
             flash("登录成功", "success")
             return redirect(next_url)
+        log.warning("登录失败 ip=%s", request.remote_addr)
         flash("密码错误", "error")
         return render_template("login.html", next=next_url)
     return render_template("login.html", next=next_url)
@@ -118,7 +177,7 @@ def login():
 
 @app.route("/logout")
 def logout():
-    session.pop("auth", None)
+    session.clear()
     flash("已登出", "info")
     return redirect(url_for("index"))
 
@@ -199,8 +258,6 @@ def request_entity_too_large(error):
 
 
 if __name__ == "__main__":
-    if ENABLE_SSL:
-        # Development-only adhoc TLS for testing. In production terminate TLS at reverse proxy.
-        app.run(debug=True, host="0.0.0.0", port=5000, ssl_context="adhoc")
-    else:
-        app.run(debug=True, host="0.0.0.0", port=5000)
+    # 仅本地调试。生产一律走 gunicorn（见 Dockerfile）。
+    # 绝不要开 debug=True：Werkzeug 调试器带交互式控制台，等于把 shell 挂出去。
+    app.run(host="127.0.0.1", port=5000, debug=False)

@@ -6,11 +6,13 @@ services:
     image: album-app:latest
     restart: always
     environment:
-      - PASSWORD=${PASSWORD}
+      - PASSWORD_HASH=${PASSWORD_HASH}
       - SECRET_KEY=${SECRET_KEY}
-      - MAX_CONTENT_LENGTH=${MAX_CONTENT_LENGTH:-16777216}
+      # 与 nginx 的 client_max_body_size 50M 对齐
+      - MAX_CONTENT_LENGTH=${MAX_CONTENT_LENGTH:-52428800}
       - UPLOAD_FOLDER=/app/uploads
-      - ENABLE_SSL=0
+      - BEHIND_TLS=${BEHIND_TLS:-1}
+      - SESSION_LIFETIME_DAYS=${SESSION_LIFETIME_DAYS:-7}
     volumes:
       - ./uploads:/app/uploads
     expose:

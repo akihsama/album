@@ -8,7 +8,9 @@ What I added
 - .env.example: example environment file for docker-compose variables.
 
 Quick start (testing with self-signed cert)
-1. Copy the example env: cp .env.example .env and edit PASSWORD/SECRET_KEY.
+1. Copy the example env: cp .env.example .env
+   - SECRET_KEY: openssl rand -hex 32
+   - PASSWORD_HASH: python scripts/init_password.py （不要再写明文口令）
 2. Generate a local self-signed cert (for testing):
    chmod +x scripts/generate-self-signed-cert.sh
    ./scripts/generate-self-signed-cert.sh example.com
@@ -26,7 +28,9 @@ Production notes (Let's Encrypt)
 
 Security reminders
 - Do NOT use self-signed certs in production.
-- Ensure SECRET_KEY and PASSWORD are strong and injected from a secure source (secrets manager / environment not committed to repo).
+- Ensure SECRET_KEY and PASSWORD_HASH are strong and injected from a secure source (secrets manager / environment not committed to repo). Both are required: the app refuses to start if either is missing.
+- Never run with `debug=True`. The Werkzeug debugger exposes an interactive console.
+- Run tests before deploying: `python -m unittest discover tests`
 - Use a hardened nginx config and enable HSTS only after confirming TLS works.
 - Consider running the app under a non-root user inside the container and set proper file permissions for uploads.
 

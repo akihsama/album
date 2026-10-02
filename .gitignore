@@ -13,5 +13,19 @@ venv/
 uploads/*
 !uploads/.gitkeep
 
+# Certificates and private keys (scripts/generate-self-signed-cert.sh 会生成到这里)
+certs/
+*.pem
+*.key
+
+# Runtime secrets and databases
+vault.json
+*.db
+sessions.db
+
+# Generated thumbnails
+thumbs/
+*.webp
+
 # OS files
 .DS_Store
