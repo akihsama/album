@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block content %}
+  <h2>受保护页面</h2>
+  {% if files %}
+    <ul>
+      {% for file_name in files %}
+        <li><a href="{{ url_for('uploaded_file', filename=file_name) }}">{{ file_name }}</a></li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p>当前没有上传文件。</p>
+  {% endif %}
+{% endblock %}

@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>上传站点</title>
+    <style>
+      body {
+        max-width: 900px;
+        margin: 40px auto;
+        padding: 0 20px;
+        font-family: Arial, sans-serif;
+      }
+      nav {
+        margin-bottom: 20px;
+      }
+      nav a {
+        margin-right: 12px;
+      }
+      .flash {
+        padding: 10px 12px;
+        margin-bottom: 16px;
+        border-radius: 5px;
+      }
+      .success { background: #eafaf1; border: 1px solid #a7e4bd; }
+      .error { background: #fdecec; border: 1px solid #f5b7b1; }
+      .info { background: #eef6ff; border: 1px solid #cfe2ff; }
+      form {
+        margin: 20px 0;
+      }
+      input[type="file"], input[type="password"] {
+        margin-right: 10px;
+      }
+      ul {
+        padding-left: 20px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>上传站点</h1>
+      <nav>
+        <a href="{{ url_for('index') }}">首页</a>
+        <a href="{{ url_for('protected') }}">受保护页面</a>
+        {% if session.get('auth') %}
+          <a href="{{ url_for('logout') }}">退出登录</a>
+        {% else %}
+          <a href="{{ url_for('login') }}">登录</a>
+        {% endif %}
+      </nav>
+      <hr />
+    </header>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        {% for category, message in messages %}
+          <div class="flash {{ category }}">{{ message }}</div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
+
+    {% block content %}{% endblock %}
+  </body>
+</html>

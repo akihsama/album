@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block content %}
+  <h2>上传文件</h2>
+  <form action="{{ url_for('upload') }}" method="post" enctype="multipart/form-data">
+    <input type="file" name="file" required />
+    <button type="submit">上传</button>
+  </form>
+
+  <p>允许的文件类型：{{ allowed }}</p>
+  <p>上传后只能在“受保护页面”中查看和下载，需要登录密码。</p>
+{% endblock %}
