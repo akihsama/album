@@ -1,0 +1,7 @@
+example.com {
+    encode gzip
+    reverse_proxy app:8000
+}
+
+# If you don't have a domain yet, you can temporarily use Cloudflare Tunnel instead.
+# For a custom domain, replace example.com with your actual domain and ensure DNS points to this server.

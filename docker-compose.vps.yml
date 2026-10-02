@@ -1,0 +1,39 @@
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    environment:
+      - PASSWORD=${PASSWORD}
+      - SECRET_KEY=${SECRET_KEY}
+      - UPLOAD_FOLDER=/app/uploads
+      - MAX_CONTENT_LENGTH=${MAX_CONTENT_LENGTH:-16777216}
+      - SESSION_COOKIE_SECURE=1
+    volumes:
+      - ./uploads:/app/uploads
+    expose:
+      - "8000"
+    networks:
+      - appnet
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - appnet
+
+networks:
+  appnet:
+    driver: bridge
+
+volumes:
+  caddy_data:
+  caddy_config:
