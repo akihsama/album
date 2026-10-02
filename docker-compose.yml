@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    image: album-app:latest
+    restart: always
+    environment:
+      - PASSWORD=${PASSWORD}
+      - SECRET_KEY=${SECRET_KEY}
+      - MAX_CONTENT_LENGTH=${MAX_CONTENT_LENGTH:-16777216}
+      - UPLOAD_FOLDER=/app/uploads
+      - ENABLE_SSL=0
+    volumes:
+      - ./uploads:/app/uploads
+    expose:
+      - "8000"
+    networks:
+      - web
+
+  nginx:
+    image: nginx:stable
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      # mount certs directory here; replace example.com with your domain path
+      - ./certs:/etc/letsencrypt
+    depends_on:
+      - app
+    networks:
+      - web
+
+networks:
+  web:
+    driver: bridge

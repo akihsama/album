@@ -1,38 +1,38 @@
-# File Upload + Password Protected Subpage (Enhanced)
+Deployment: Docker + Nginx (TLS termination)
 
-此版本在之前基础上增加：
+What I added
+- Dockerfile: runs the Flask app with Gunicorn on port 8000.
+- docker-compose.yml: defines two services: app and nginx. Nginx listens on 80/443 and proxies to the app service.
+- nginx/ conf: example nginx config that redirects HTTP->HTTPS and proxies / to the Gunicorn app. TLS cert paths point to /etc/letsencrypt/live/<domain>/fullchain.pem.
+- scripts/generate-self-signed-cert.sh: create a self-signed cert for local testing (drops into ./certs/live/<domain>/).
+- .env.example: example environment file for docker-compose variables.
 
-- 支持多文件上传
-- 支持文件删除（需登录）
-- 支持图片预览（在受保护页面内显示缩略图，点击可查看原图）
-- CSRF 保护的简单实现
-- 会话 Cookie 安全配置（在 TLS 下生效）
-- 可用 `ENABLE_SSL=1` 启用 Flask 的 adhoc TLS（仅用于测试）以避免明文传输
+Quick start (testing with self-signed cert)
+1. Copy the example env: cp .env.example .env and edit PASSWORD/SECRET_KEY.
+2. Generate a local self-signed cert (for testing):
+   chmod +x scripts/generate-self-signed-cert.sh
+   ./scripts/generate-self-signed-cert.sh example.com
+   This writes cert files to ./certs/live/example.com/fullchain.pem and privkey.pem.
+3. Update nginx/conf.d/site.conf: replace server_name example.com with the domain you used.
+4. Start services:
+   docker compose up -d --build
+5. Visit:
+   https://localhost (you may need to accept the self-signed cert in your browser) or https://example.com if DNS points to the host.
 
-## 快速启动（开发）
+Production notes (Let's Encrypt)
+- Obtain real certs for your domain and place them (or use a cert manager) under ./certs/live/<your-domain>/fullchain.pem and privkey.pem. Then docker-compose will make them available to nginx.
+- Better: use an automated reverse-proxy + Let's Encrypt companion (nginx-proxy + docker-letsencrypt-nginx-proxy-companion) or use a host-managed certificate (cloud load balancer or Traefik/Caddy which integrate with ACME).
+- Configure your DNS to point the domain to the host IP and run certbot to obtain certs, or use a managed solution.
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-export PASSWORD="your-password"
-export SECRET_KEY="generate-a-random-secret"
-mkdir -p uploads
-# 可选：启用临时 TLS（仅测试）
-export ENABLE_SSL=1
-python app.py
-```
+Security reminders
+- Do NOT use self-signed certs in production.
+- Ensure SECRET_KEY and PASSWORD are strong and injected from a secure source (secrets manager / environment not committed to repo).
+- Use a hardened nginx config and enable HSTS only after confirming TLS works.
+- Consider running the app under a non-root user inside the container and set proper file permissions for uploads.
 
-在浏览器访问：
-- https://127.0.0.1:5000/  （如果启用了 ENABLE_SSL）
-- http://127.0.0.1:5000/   （否则）
+If you want, I can:
+- Add an automated nginx-proxy + Let's Encrypt companion docker-compose setup (zero-config for certs) OR
+- Provide a Traefik-based docker-compose that automatically obtains/refreshes certificates from Let's Encrypt OR
+- Create a cloud-specific deployment guide (e.g., Google Cloud Run, AWS ECS, DigitalOcean App Platform).
 
-登录后访问 /protected 可查看、预览与删除上传的文件。
-
-## 部署建议（生产）
-
-- 始终在前端使用 TLS（HTTPS）。不要在生产中直接使用 Flask 的内置服务器暴露到互联网。使用 Nginx/Traefik/Caddy 或云负载均衡来终止 TLS 并反向代理到 Gunicorn/Uvicorn。
-- 在部署环境中确保 `SESSION_COOKIE_SECURE` 为 true（本仓库在 app.config 中已设置）并通过环境变量传入强 `SECRET_KEY` 与 `PASSWORD`。
-- 对上传文件做额外检查（检查 MIME、扫描病毒、限制最大分辨率/尺寸等）。
-- 如果多用户访问，使用真实用户认证（Flask-Login + 数据库）、权限与审计日志。
-
+Tell me which option you prefer and I'll add it to the repo and push the changes.
