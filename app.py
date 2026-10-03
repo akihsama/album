@@ -80,7 +80,12 @@ app.secret_key = SECRET_KEY
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=SESSION_LIFETIME_DAYS)
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
-app.config["SESSION_COOKIE_SECURE"] = BEHIND_TLS   # 只在 TLS 下发送 cookie
+app.config["SESSION_COOKIE_PATH"] = "/"
+# SESSION_COOKIE_SECURE=1 可强制覆盖（例如反代只解了一半 TLS）；不设就按 BEHIND_TLS 走，
+# 并在 before_request 里按真实 scheme 微调 —— 否则「http 下 Secure cookie 不被保存」
+# 会让人以为密码输了却进不去（新终端最常见的假故障）。
+SECURE_COOKIE_FORCED = os.environ.get("SESSION_COOKIE_SECURE") == "1"
+app.config["SESSION_COOKIE_SECURE"] = BEHIND_TLS
 
 # 让 Flask 识别真实协议与来源 IP（否则限流拿到的全是 nginx 的内网 IP）
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
@@ -93,6 +98,15 @@ limiter = Limiter(
     default_limits=["600/hour"],
     storage_uri=os.environ.get("LIMITER_STORAGE", "memory://"),
 )
+
+# ----- 监听地址 -----
+# 默认只绑回环地址（最安全）。要在「别的终端/手机」上用，就显式设 HOST=0.0.0.0
+# （推荐走 scripts/serve_lan.py，它会先打印局域网地址并做安全提示）。
+HOST = os.environ.get("HOST", "127.0.0.1")
+PORT = int(os.environ.get("PORT", "5000"))
+if HOST in ("0.0.0.0", "::"):
+    log.warning("⚠ 正在监听所有网卡（%s:%s）；同一局域网内任何设备都能连上来，"
+                "务必确认防火墙只放行可信网段，且 / 有密码门。", HOST, PORT)
 
 os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
 os.makedirs(app.config["THUMB_FOLDER"], exist_ok=True)
@@ -107,6 +121,17 @@ _thumb_sem = threading.Semaphore(int(os.environ.get("THUMB_CONCURRENCY", "2")))
 # 触发后给的是友好页面（见 errorhandler 429），而不是 Werkzeug 的裸 429 文本，
 # 否则用户会以为"密码不对"。
 LOGIN_RATE = os.environ.get("LOGIN_RATE", "20/minute")
+
+
+def get_login_key() -> str:
+    """登录限流的桶 = IP + 浏览器指纹。
+
+    多终端（手机、平板、家里的电脑）在同一个出口 IP 后面时，若只按 IP 计数，
+    一台设备输错几次，其余设备全被 429 挡住 —— 看起来就像"密码在别的终端不起作用"。
+    按 IP+UA 分桶后，各终端互不影响，脚本爆破仍然会被同一 IP 累计拦下。
+    """
+    ua = (request.headers.get("User-Agent") or "unknown")[:120]
+    return f"{request.remote_addr}|{ua}"
 
 
 # ----- 数据库（每请求一连接）-----
@@ -162,11 +187,46 @@ def _safe_id(file_id: str) -> bool:
     return len(file_id) == 32 and all(c in "0123456789abcdef" for c in file_id)
 
 
+@app.before_request
+def sync_session_policy():
+    """让 cookie 策略跟着真实 scheme 走。
+
+    生产里「反代终结 TLS、但访问其实是 http」时，Secure cookie 会被浏览器直接丢弃，
+    表现成：密码明明对了、跳一下又回到登录页。这里按真实 scheme 定，并把这种情况
+    在页面上点出来，而不是让用户自己猜。
+    """
+    if SECURE_COOKIE_FORCED:
+        return
+    desired = BEHIND_TLS and request.is_secure
+    app.config["SESSION_COOKIE_SECURE"] = desired
+    g.insecure_scheme = bool(BEHIND_TLS) and not request.is_secure
+
+
+_INSECURE_WARNED: set[str] = set()
+
+
+@app.after_request
+def warn_insecure_session(resp):
+    """BEHIND_TLS=1 却走 http 时留痕，方便一眼定位为什么登录态留不住。"""
+    if getattr(g, "insecure_scheme", False):
+        key = f"{request.remote_addr}"
+        if key not in _INSECURE_WARNED:
+            _INSECURE_WARNED.add(key)
+            log.warning("⚠ 以 http 访问（%s），会话 cookie 不会被浏览器保存。"
+                        "要么换成 https，要么把 BEHIND_TLS 设成 0。", key)
+    return resp
+
+
 @app.after_request
 def security_headers(resp):
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
     resp.headers.setdefault("Referrer-Policy", "no-referrer")
     resp.headers.setdefault("X-Frame-Options", "DENY")
+    # 登录态相关的 HTML 一律不缓存：页面里带着 CSRF token，
+    # 一旦被浏览器缓存，下次打开就是过期 token —— 删除/上传会莫名 403，
+    # 看上去像"功能坏了"，其实是页面比会话老。
+    if (resp.mimetype or "").startswith("text/html"):
+        resp.headers["Cache-Control"] = "no-store, must-revalidate"
     return resp
 
 
@@ -242,7 +302,14 @@ def safe_next(raw: str) -> str:
 def gate():
     if session.get("auth"):
         return redirect(url_for("protected"))
-    return render_template("login.html", next=url_for("protected"))
+    # 勾了「7 天记住」时 cookie 才带 Longmax-age；这里按当前标记回传，
+    # 让页面显示的到期时间和真实行为一致，别骗用户。
+    return render_template(
+        "login.html",
+        next=url_for("protected"),
+        insecure_warning=bool(getattr(g, "insecure_scheme", False)),
+        days=SESSION_LIFETIME_DAYS,
+    )
 
 
 @app.route("/upload", methods=["GET"])
@@ -287,32 +354,45 @@ def upload():
     return redirect(url_for("protected"))
 
 
+@app.route("/healthz")
+def healthz():
+    """给反向代理/容器健康检查用，不需要登录，也不泄露信息。"""
+    return "ok"
+
+
 @app.route("/login", methods=["GET", "POST"])
-@limiter.limit(LOGIN_RATE, methods=["POST"])
+@limiter.limit(LOGIN_RATE, methods=["POST"], key_func=get_login_key)
 def login():
     next_url = safe_next(request.args.get("next"))
+    days = SESSION_LIFETIME_DAYS
     if request.method == "POST":
         pwd = request.form.get("password", "")
         if verify_password(pwd):
             # 登录成功必须重建会话，防会话固定
             session.clear()
             session["auth"] = True
-            session.permanent = True
+            # 「记住我」默认勾上：每个终端输一次密码，就管用 7 天。
+            # 不勾则浏览器一关会话就没了。
+            session.permanent = request.form.get("remember") == "on"
             ensure_csrf()
-            log.info("登录成功 ip=%s", request.remote_addr)
-            flash("登录成功", "success")
+            log.info("登录成功 ip=%s 记住=%s",
+                     request.remote_addr, session.permanent)
+            flash(f"欢迎回来，{days} 天内不用再输密码" if session.permanent else "登录成功（本次会话有效）",
+                  "success")
             return redirect(next_url)
         log.warning("登录失败 ip=%s", request.remote_addr)
         flash("密码错误", "error")
-        return render_template("login.html", next=next_url)
-    return render_template("login.html", next=next_url)
+        return render_template("login.html", next=next_url, days=days,
+                               insecure_warning=getattr(g, "insecure_scheme", False))
+    return render_template("login.html", next=next_url, days=days,
+                           insecure_warning=getattr(g, "insecure_scheme", False))
 
 
 @app.route("/logout")
 def logout():
     session.clear()
     flash("已登出", "info")
-    return redirect(url_for("upload_page"))
+    return redirect(url_for("gate"))
 
 
 @app.route("/protected")
@@ -388,12 +468,16 @@ def api_delete():
         return jsonify({"ok": False, "error": "未指定文件"}), 400
 
     con = get_db()
-    removed = []
+    removed, missing = [], []
     for file_id in ids:
+        # 区分"删掉了"和"压根不存在"，前端才能说实话，而不是笼统报"可能已被删过"。
+        # 秒传带来的重复内容只落一条记录，同名别名在库里查不到，属于 latter。
         if not _safe_id(file_id):
+            missing.append(file_id)
             continue
         row = store.get_file(con, file_id)
         if not row:
+            missing.append(file_id)
             continue
         for p in (
             os.path.join(app.config["UPLOAD_FOLDER"], row["stored_name"]),
@@ -407,8 +491,8 @@ def api_delete():
         store.delete_file(con, file_id)
         removed.append(file_id)
 
-    log.info("删除 %d 个文件", len(removed))
-    return jsonify({"ok": True, "removed": removed})
+    log.info("删除 %d 个文件，%d 个不存在", len(removed), len(missing))
+    return jsonify({"ok": True, "removed": removed, "missing": missing})
 
 
 @app.errorhandler(413)
@@ -425,6 +509,8 @@ def too_many_requests(error):
 
 
 if __name__ == "__main__":
-    # 仅本地调试。生产一律走 gunicorn（见 Dockerfile）。
+    # 仅本地调试 / 多终端直连。生产一律走 gunicorn（见 Dockerfile）。
     # 绝不要开 debug=True：Werkzeug 调试器带交互式控制台，等于把 shell 挂出去。
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    # 要给别的设备开，用 scripts/serve_lan.py（它会打印局域网地址再拉起）。
+    log.info("监听 %s:%s（多终端请用 scripts/serve_lan.py）", HOST, PORT)
+    app.run(host=HOST, port=PORT, debug=False)

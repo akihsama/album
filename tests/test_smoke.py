@@ -8,7 +8,9 @@ import sys
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 TMP = Path(tempfile.mkdtemp(prefix="album-smoke-"))
@@ -182,6 +184,109 @@ class AuthTest(Base):
         album.limiter.enabled = False
 
 
+class MultiDeviceTest(Base):
+    """「换一个终端/手机，也只要输一次密码就能进」这条需求的行为保证。"""
+
+    def login_with(self, **form):
+        data = {"password": TEST_PWD}
+        data.update(form)
+        return self.c.post("/login", data=data)
+
+    def test_remember_me_is_checked_by_default(self):
+        """默认勾上「记住」，否则每开一次浏览器就要重输一次密码。"""
+        body = self.c.get("/").get_data(as_text=True)
+        self.assertIn('name="remember"', body)
+        self.assertIn("checked", body, "记住我默认是关的，换终端就要反复输密码")
+
+    def test_session_covers_all_pages_after_one_login(self):
+        """一个终端输一次密码，整站都能用。"""
+        self.login_with(remember="on")
+        self.assertEqual(self.c.get("/").status_code, 302)
+        self.assertEqual(self.c.get("/protected").status_code, 200)
+        self.assertEqual(self.c.get("/api/files").status_code, 200)
+        body = self.c.get("/protected").get_data(as_text=True)
+        self.assertNotIn("输入密码即可进入", body, "登录后还被弹回登录页")
+
+    def test_remember_creates_long_lived_cookie(self):
+        self.login_with(remember="on")
+        cookie = self.c.get_cookie("session")
+        self.assertIsNotNone(cookie, "没下发会话 cookie")
+        # Flask 用的是 Expires（不是 Max-Age），所以看 expires 有没有推到 7 天后
+        self.assertIsNotNone(cookie.expires, "勾了记住我却没有长期 cookie")
+        self.assertGreater(cookie.expires - datetime.now(timezone.utc), timedelta(days=6))
+
+    def test_without_remember_cookie_still_works_this_session(self):
+        self.login_with()
+        self.assertEqual(self.c.get("/protected").status_code, 200)
+
+    def test_second_device_is_independent_of_first(self):
+        """两台设备各自有会话，一台登出不该影响另一台。"""
+        self.login_with(remember="on")
+        phone = album.app.test_client()          # 模拟另一台终端
+        phone.post("/login", data={"password": TEST_PWD, "remember": "on"})
+        self.assertEqual(phone.get("/protected").status_code, 200)
+
+        self.c.get("/logout")
+        self.assertEqual(self.c.get("/protected").status_code, 302)
+
+        self.assertEqual(phone.get("/protected").status_code, 200,
+                         "一台设备登出把另一台也踢了")
+
+    def test_login_rate_limit_is_per_device(self):
+        """同一出口 IP 下多台设备不能互相连坐（否则就像"在别的终端密码失效"）。"""
+        album.limiter.enabled = True
+        album.limiter.reset()
+        try:
+            laptop = album.app.test_client()
+            phone = album.app.test_client()
+            ua_laptop = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+            ua_phone = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0)"
+            for _ in range(LOGIN_LIMIT + 2):
+                laptop.post("/login", data={"password": "x"},
+                            headers={"User-Agent": ua_laptop})
+            codes = [phone.post("/login", data={"password": "x"},
+                                headers={"User-Agent": ua_phone}).status_code
+                     for _ in range(3)]
+            self.assertNotIn(429, codes,
+                             f"第二台设备被同一出口 IP 连坐限流了: {codes}")
+        finally:
+            album.limiter.enabled = False
+            album.limiter.reset()
+
+    def test_logout_returns_to_password_gate(self):
+        """登出要回到只输密码的那扇门，而不是跳到还需要鉴权的上传页。"""
+        self.login_with()
+        loc = self.c.get("/logout", follow_redirects=False).headers["Location"]
+        self.assertEqual(loc, "/")
+
+    def test_healthcheck_needs_no_auth_but_leaks_nothing(self):
+        r = self.c.get("/healthz")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_data(as_text=True), "ok")
+
+
+class SchemeMismatchTest(Base):
+    """BEHIND_TLS=1 却用 http 打开：必须讲清楚，而不是静默地留不住登录态。"""
+
+    def test_plain_http_explains_cookie_will_not_stick(self):
+        """这条用例防的是「密码对了但一直跳回登录页」这种最难查的假故障。"""
+        with unittest.mock.patch.object(album, "BEHIND_TLS", True), \
+             unittest.mock.patch.dict(album.app.config, SESSION_COOKIE_SECURE=False):
+            album._INSECURE_WARNED.clear()
+            body = self.c.get("/").get_data(as_text=True)
+        self.assertIn("http", body)
+        self.assertIn("BEHIND_TLS", body, "没告诉用户该怎么改")
+
+    def test_https_session_cookie_is_marked_secure(self):
+        """真走 https 时，cookie 必须带 Secure，否则会话在走廊里能被读。"""
+        with unittest.mock.patch.object(album, "BEHIND_TLS", True):
+            c = album.app.test_client()
+            r = c.post("/login", data={"password": TEST_PWD, "remember": "on"},
+                       base_url="https://album.local")
+        self.assertIn("Secure", " ".join(r.headers.getlist("Set-Cookie")),
+                      "https 下没打 Secure 标记")
+
+
 class IdValidationTest(Base):
     """路由只接受 32 位十六进制 id，路径穿越在进文件系统之前就被挡掉。"""
 
@@ -307,6 +412,55 @@ class DeleteTest(Base):
         item = self.c.get("/api/files").get_json()["items"][0]
         r = self.c.post("/api/delete", json={"ids": [item["id"]]})
         self.assertEqual(r.status_code, 403, "缺 CSRF 竟然删成功了")
+
+    def test_delete_error_carries_readable_reason(self):
+        """前端要把原因直接显示给用户，只给个 403 号没人在乎。
+
+        之前前端只会 alert('删除失败：403')，用户根本不知道该怎么办。
+        """
+        csrf = self.login()
+        self.upload_one(csrf, "keep.png", make_png(400, 300))
+        item = self.c.get("/api/files").get_json()["items"][0]
+        r = self.c.post("/api/delete", json={"ids": [item["id"]]})
+        self.assertEqual(r.status_code, 403)
+        self.assertIn("CSRF", r.get_json()["error"],
+                      "拒绝原因不够直白，前端没法原样展示")
+
+    def test_delete_rejects_unknown_and_malformed_ids(self):
+        """不存在的 id 不能把整个删除请求顶成 500，而且要单独归类，别混进 removed。"""
+        csrf = self.login()
+        r = self.c.post("/api/delete", json={"ids": ["deadbeef"]},
+                        headers={"X-CSRFToken": csrf})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json()["removed"], [], "伪造 id 竟然算删除成功")
+        self.assertEqual(r.get_json()["missing"], ["deadbeef"])
+        self.assertEqual(self.c.get("/api/files").get_json()["total"], 0)
+
+    def test_delete_reports_dedup_alias_as_missing(self):
+        """秒传的重复内容只存一条记录：删别名时如实说"不存在"，而不是假装删成功。"""
+        csrf = self.login()
+        payload = make_png(color=(9, 99, 199))
+        self.upload_one(csrf, "one.png", payload)
+        self.upload_one(csrf, "alias.png", payload)      # 内容相同 → 秒传，不落第二行
+        data = self.c.get("/api/files").get_json()
+        self.assertEqual(data["total"], 1)
+
+        r = self.c.post("/api/delete", json={"ids": [i["id"] for i in data["items"]]},
+                        headers={"X-CSRFToken": csrf})
+        body = r.get_json()
+        self.assertEqual(len(body["removed"]), 1, "重复内容应该只被删掉一条记录")
+        self.assertEqual(len(body["missing"]), 0)
+
+    def test_auth_pages_are_not_browser_cached(self):
+        """HTML 带缓存 → 过期页面里的 CSRF token 会把删除/上传顶成 403。
+
+        这就是「删除功能看起来坏了」最常见的根因，必须从源头堵住。
+        """
+        self.login()
+        for url in ("/", "/login", "/protected"):
+            r = self.c.get(url)
+            self.assertIn("no-store", r.headers.get("Cache-Control", ""),
+                          f"{url} 被允许缓存，过期页面会带坏 token")
 
 
 if __name__ == "__main__":

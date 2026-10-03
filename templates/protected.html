@@ -218,22 +218,78 @@
       hint.textContent = done ? (items.length === 0 ? '还没有文件，先去上传吧。' : '已经全部加载完。') : '';
     }
 
+    /* 删除。这里把「为什么失败」讲清楚，而不是笼统弹一句 HTTP 状态码。
+
+       真实使用中删除最常见的两种假死：
+         · 页面被浏览器缓存后带着过期 CSRF token → 403
+         · 另一个标签页重新登录过，会话 token 换了，当前页面还是旧的 → 403
+       两种情况都提示用户刷新，并顺手把页面里那一份 token 刷新掉。 */
+    let deleting = false;
+
+    function notify(msg) {
+      hint.textContent = msg;
+      hint.style.color = '#a1282a';
+    }
+
     async function remove(ids) {
-      const res = await fetch('/api/delete', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-CSRFToken': CSRF },
-        body: JSON.stringify({ ids: ids }),
-      });
-      if (!res.ok) { alert('删除失败：' + res.status); return; }
-      ids.forEach((id) => {
-        const el = grid.querySelector('.card[data-id="' + id + '"]');
-        if (el) el.remove();
-        picked.delete(id);
-      });
-      items = items.filter((it) => ids.indexOf(it.id) === -1);
-      total = Math.max(0, total - ids.length);
-      countEl.textContent = items.length + ' / ' + total + ' 个';
-      delSel.disabled = picked.size === 0;
+      if (deleting || !ids || ids.length === 0) return;
+      deleting = true;
+      delSel.disabled = true;
+      try {
+        const res = await fetch('/api/delete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-CSRFToken': CSRF },
+          body: JSON.stringify({ ids: ids }),
+        });
+
+        if (res.status === 401 || res.status === 403) {
+          notify('登录状态已失效（HTTP ' + res.status + '），正在回到密码页…');
+          alert('操作被拒绝：页面已过期或登录状态失效。\n点「确定」刷新页面，重新输入密码后再删除。\n\n（若反复出现，说明浏览器缓存了旧页面，按 Ctrl+F5 强制刷新。）');
+          location.href = '/login';
+          return;
+        }
+        if (!res.ok) {
+          let detail = 'HTTP ' + res.status;
+          try {
+            const j = await res.clone().json();
+            if (j && j.error) detail = j.error;
+          } catch (e) { /* 非 JSON 就用状态码 */ }
+          notify('删除失败：' + detail);
+          alert('删除失败：' + detail + '\n建议刷新页面（Ctrl+F5）后重试。');
+          return;
+        }
+
+        let data = {};
+        try { data = await res.json(); } catch (e) { /* 空响应也按成功处理 */ }
+        // 只认服务端真正删掉的那些，别把没删掉的从界面上抹掉
+        const removed = data.removed || ids;
+
+        removed.forEach((id) => {
+          const el = grid.querySelector('.card[data-id="' + id + '"]');
+          if (el) el.remove();
+          picked.delete(id);
+        });
+        items = items.filter((it) => removed.indexOf(it.id) === -1);
+        total = Math.max(0, total - removed.length);
+        countEl.textContent = items.length + ' / ' + total + ' 个';
+
+        const absent = data.missing || [];
+        if (absent.length > 0) {
+          notify('已删除 ' + removed.length + ' 个' +
+                 (absent.length === ids.length ? '（选中的都不存在，可能是重复内容）'
+                                               : '，' + absent.length + ' 个已不存在'));
+        } else {
+          notify('已删除 ' + removed.length + ' 个文件。');
+        }
+        hint.style.color = '';
+        if (removed.length === 0) location.reload();   // 全都没删掉就整页刷新，别留下假界面
+      } catch (err) {
+        notify('删除失败：网络错误 ' + err);
+        alert('删除失败：连不上服务器（' + err + '）。\n请检查网络后刷新页面重试。');
+      } finally {
+        deleting = false;
+        delSel.disabled = picked.size === 0;
+      }
     }
 
     function openBox(index) {
