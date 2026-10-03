@@ -1,11 +1,73 @@
-{% extends "base.html" %}
-{% block content %}
-  <h2>登录</h2>
-  <form method="post" action="{{ url_for('login', next=next) }}">
-    <label>
-      密码：
-      <input type="password" name="password" required />
-    </label>
-    <button type="submit">登录</button>
-  </form>
-{% endblock %}
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>相册 · 进入</title>
+    <style>
+      * { box-sizing: border-box; }
+      body {
+        margin: 0; min-height: 100vh;
+        display: flex; align-items: center; justify-content: center;
+        background: #f2f3f5;
+        font-family: -apple-system, "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+        color: #1f2329;
+      }
+      .card {
+        width: 340px; max-width: calc(100vw - 32px);
+        background: #fff; border-radius: 12px;
+        box-shadow: 0 8px 28px rgba(0, 0, 0, .08);
+        padding: 34px 28px 26px; text-align: center;
+      }
+      .logo { font-size: 30px; line-height: 1; margin-bottom: 10px; }
+      h1 { font-size: 19px; margin: 0 0 6px; font-weight: 600; }
+      .sub { font-size: 13px; color: #8a9099; margin-bottom: 22px; }
+      label { display: block; text-align: left; font-size: 13px; color: #606770; margin-bottom: 7px; }
+      input[type="password"] {
+        width: 100%; height: 44px; padding: 0 13px;
+        font-size: 15px; border: 1px solid #dcdfe6; border-radius: 8px;
+        outline: none; transition: border-color .15s, box-shadow .15s;
+      }
+      input[type="password"]:focus {
+        border-color: #2f6fed; box-shadow: 0 0 0 3px rgba(47, 111, 237, .14);
+      }
+      button {
+        width: 100%; height: 44px; margin-top: 15px;
+        border: 0; border-radius: 8px; cursor: pointer;
+        background: #2f6fed; color: #fff; font-size: 15px; font-weight: 500;
+        transition: background .15s;
+      }
+      button:hover { background: #2559cf; }
+      button:active { background: #1f4bb0; }
+      .msg {
+        padding: 9px 12px; border-radius: 7px; font-size: 13px;
+        margin-bottom: 14px; text-align: left;
+      }
+      .msg.error { background: #fdecec; border: 1px solid #f5b7b1; color: #a1282a; }
+      .msg.ok { background: #eafaf1; border: 1px solid #a7e4bd; color: #1c7c46; }
+      .tip { margin-top: 16px; font-size: 12px; color: #a3a8b0; line-height: 1.6; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <div class="logo">🖼️</div>
+      <h1>我的相册</h1>
+      <p class="sub">输入密码即可进入</p>
+
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% for category, message in messages %}
+          <div class="msg {% if category in ('message',) %}ok{% else %}{{ category }}{% endif %}">{{ message }}</div>
+        {% endfor %}
+      {% endwith %}
+
+      <form method="post" action="{{ url_for('login', next=next) }}" autocomplete="off">
+        <label for="password">密码</label>
+        <input id="password" type="password" name="password"
+               autofocus autocomplete="current-password" placeholder="请输入密码" />
+        <button type="submit">进入相册</button>
+      </form>
+
+      <p class="tip">登录后 7 天内无需重复输入，点击右上角「退出登录」可立即清除。</p>
+    </div>
+  </body>
+</html>

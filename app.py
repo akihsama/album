@@ -103,6 +103,11 @@ _ph = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=4)
 # 单张峰值能到几百 MB。小内存机器上并发几张就会撑爆。
 _thumb_sem = threading.Semaphore(int(os.environ.get("THUMB_CONCURRENCY", "2")))
 
+# 登录限流：单用户自用，20/分钟足够挡住脚本爆破，又不会自己调试时把自己锁住。
+# 触发后给的是友好页面（见 errorhandler 429），而不是 Werkzeug 的裸 429 文本，
+# 否则用户会以为"密码不对"。
+LOGIN_RATE = os.environ.get("LOGIN_RATE", "20/minute")
+
 
 # ----- 数据库（每请求一连接）-----
 def get_db():
@@ -223,10 +228,30 @@ def ingest(file) -> tuple[str, str]:
 
 
 # ----- 路由 -----
+
+
+def safe_next(raw: str) -> str:
+    """只接受站内绝对路径，挡掉 ?next=https://evil.com 这类开放重定向。"""
+    if raw and raw.startswith("/") and not raw.startswith("//"):
+        return raw
+    return url_for("protected")
+
+
+# 根地址就是唯一的门：已登录 → 直接进相册；未登录 → 只要求输一次密码
 @app.route("/", methods=["GET"])
-def index():
+def gate():
+    if session.get("auth"):
+        return redirect(url_for("protected"))
+    return render_template("login.html", next=url_for("protected"))
+
+
+@app.route("/upload", methods=["GET"])
+def upload_page():
+    if not ALLOW_ANONYMOUS_UPLOAD and not session.get("auth"):
+        return redirect(url_for("login", next=url_for("upload_page")))
     csrf = ensure_csrf()
-    return render_template("index.html", allowed=", ".join(sorted(ALLOWED_EXTENSIONS)), csrf=csrf)
+    return render_template("index.html", allowed=", ".join(sorted(ALLOWED_EXTENSIONS)),
+                           csrf=csrf)
 
 
 @app.route("/upload", methods=["POST"])
@@ -237,12 +262,12 @@ def upload():
     form_csrf = request.form.get("csrf_token")
     if not form_csrf or form_csrf != session.get("csrf_token"):
         flash("无效的请求（CSRF 检测失败）", "error")
-        return redirect(url_for("index"))
+        return redirect(url_for("upload_page"))
 
     files = request.files.getlist("files")
     if not files:
         flash("未选择文件", "error")
-        return redirect(url_for("index"))
+        return redirect(url_for("upload_page"))
 
     saved, dup, skipped, failed = [], [], [], []
     for file in files:
@@ -263,9 +288,9 @@ def upload():
 
 
 @app.route("/login", methods=["GET", "POST"])
-@limiter.limit("10/minute", methods=["POST"])
+@limiter.limit(LOGIN_RATE, methods=["POST"])
 def login():
-    next_url = request.args.get("next") or url_for("protected")
+    next_url = safe_next(request.args.get("next"))
     if request.method == "POST":
         pwd = request.form.get("password", "")
         if verify_password(pwd):
@@ -287,7 +312,7 @@ def login():
 def logout():
     session.clear()
     flash("已登出", "info")
-    return redirect(url_for("index"))
+    return redirect(url_for("upload_page"))
 
 
 @app.route("/protected")
@@ -389,7 +414,14 @@ def api_delete():
 @app.errorhandler(413)
 def request_entity_too_large(error):
     flash(f"上传文件超出限制（最大 {app.config['MAX_CONTENT_LENGTH']} 字节）", "error")
-    return redirect(url_for("index")), 413
+    return redirect(url_for("upload_page")), 413
+
+
+@app.errorhandler(429)
+def too_many_requests(error):
+    """限流命中时给中文提示，别让用户以为是自己密码输错了。"""
+    retry = getattr(error, "retry_after", None) or 60
+    return render_template("ratelimited.html", retry_after=int(retry)), 429
 
 
 if __name__ == "__main__":

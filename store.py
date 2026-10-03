@@ -97,7 +97,10 @@ def to_dict(row: sqlite3.Row) -> dict:
 
 
 def encode_cursor(created_at: float, file_id: str) -> str:
-    raw = f"{created_at:.6f}|{file_id}".encode()
+    # 必须无损：用 repr(float) 而不是 "%.6f"。%.6f 会四舍五入，
+    # 一旦游标值比真实 created_at 大，上一页最后一条就会重新出现在下一页
+    # —— 表现为列表偶发重复一条（并同时漏一条），且只在浮点恰好进位时发生。
+    raw = f"{float(created_at)!r}|{file_id}".encode()
     return base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
 
@@ -127,7 +130,14 @@ def list_files(con, limit: int = 60, cursor: str | None = None) -> tuple[list, s
     ).fetchall()
 
     items = [to_dict(r) for r in rows[:limit]]
-    next_cursor = encode_cursor(rows[limit]["created_at"], rows[limit]["id"]) if len(rows) > limit else None
+    # 游标必须指向"本页最后一条"，而不是"本页后第一条"。
+    # 指向后一条的话，WHERE 会把它自己也排除掉 —— 结果永远漏掉一张图
+    # （多张图 created_at 相同时（秒传/批量导入），漏的正好是这一页最后一张）。
+    if len(rows) > limit:
+        last = rows[limit - 1]
+        next_cursor = encode_cursor(last["created_at"], last["id"])
+    else:
+        next_cursor = None
     total = con.execute("SELECT COUNT(*) FROM files").fetchone()[0]
     return items, next_cursor, total
 

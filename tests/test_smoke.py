@@ -2,8 +2,10 @@
 
 import io
 import os
+import re
 import subprocess
 import sys
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -28,6 +30,10 @@ import app as album  # noqa: E402
 import store  # noqa: E402
 
 
+# 从 app 里读真实配额，测试就不会因为调参而自己骗自己
+LOGIN_LIMIT = int(re.split(r"[/\s]", album.LOGIN_RATE)[0])   # type: ignore[possibly-undefined]
+
+
 def make_png(w=800, h=600, color=(120, 180, 240)) -> bytes:
     """生成一张真 PNG（不是随机字节），这样缩略图才会真的被生成。"""
     from PIL import Image
@@ -43,10 +49,19 @@ class Base(unittest.TestCase):
         con = store.connect(os.environ["DB_PATH"])
         con.execute("DELETE FROM files")
         con.commit()
+        try:
+            con.execute("PRAGMA wal_checkpoint(TRUNCATE)")   # 把 WAL 并回主库
+        except sqlite3.Error:
+            pass
         con.close()
         for p in Path(TMP).glob("*"):
             if p.is_file() and p.suffix != ".db":
-                p.unlink()
+                try:
+                    p.unlink()
+                except OSError:
+                    # WAL 模式下 -shm 可能被上一个用例残留的连接占着（Windows 上删不掉）。
+                    # 不影响本用例：DELETE 是走 SQL 的，文件删不掉只会让下次重建 WAL。
+                    pass
         thumbs = Path(TMP) / "thumbs"
         if thumbs.exists():
             for p in thumbs.glob("*"):
@@ -54,6 +69,7 @@ class Base(unittest.TestCase):
 
         album.limiter.enabled = False
         album.limiter.reset()
+        self.app = album.app
         self.c = album.app.test_client()
 
     def login(self):
@@ -86,8 +102,33 @@ class StartupTest(unittest.TestCase):
 
 
 class AuthTest(Base):
-    def test_index_is_public(self):
-        self.assertEqual(self.c.get("/").status_code, 200)
+    def test_root_is_password_gate_not_upload_page(self):
+        """根地址必须只有一个密码框，而不是上传页。"""
+        body = self.c.get("/").get_data(as_text=True)
+        self.assertIn("输入密码即可进入", body)
+        self.assertIn('name="password"', body)
+
+    def test_root_goes_straight_to_album_after_login(self):
+        self.c.post("/login", data={"password": TEST_PWD})
+        r = self.c.get("/", follow_redirects=False)
+        self.assertEqual(r.status_code, 302)
+        self.assertIn("/protected", r.headers["Location"])
+
+    def test_open_redirect_blocked(self):
+        r = self.c.post("/login?next=https://evil.example.com",
+                        data={"password": TEST_PWD}, follow_redirects=False)
+        loc = r.headers.get("Location", "")
+        self.assertNotIn("evil.example.com", loc, "竟然跳到了站外地址")
+        self.assertIn("/protected", loc)
+
+    def test_rate_limit_page_is_human_readable(self):
+        """限流命中时要给中文提示，否则用户会以为是自己密码错了。"""
+        from app import too_many_requests
+        with self.app.test_request_context("/"):
+            html, code = too_many_requests(type("E", (), {"retry_after": 42})())
+        self.assertEqual(code, 429)
+        self.assertIn("尝试过于频繁", html)
+        self.assertIn("这不是密码错误", html)   # 明确告诉用户这不是密码错
 
     def test_protected_requires_login(self):
         r = self.c.get("/protected")
@@ -128,15 +169,15 @@ class AuthTest(Base):
         album.limiter.enabled = True
         album.limiter.reset()
         codes = [self.c.post("/login", data={"password": "x"}).status_code
-                 for _ in range(13)]
-        self.assertIn(429, codes, f"13 次失败登录没触发限流: {codes}")
+                 for _ in range(LOGIN_LIMIT + 3)]
+        self.assertIn(429, codes, f"{LOGIN_LIMIT + 3} 次失败登录没触发限流: {codes}")
         album.limiter.enabled = False
 
     def test_rate_limit_is_post_only(self):
         """GET /login 不该被登录限流吃掉。"""
         album.limiter.enabled = True
         album.limiter.reset()
-        codes = [self.c.get("/login").status_code for _ in range(13)]
+        codes = [self.c.get("/login").status_code for _ in range(LOGIN_LIMIT + 3)]
         self.assertNotIn(429, codes, f"GET 登录页被误限流: {codes}")
         album.limiter.enabled = False
 
@@ -211,6 +252,31 @@ class PagingTest(Base):
                 break
         self.assertEqual(len(seen), 7, f"分页总数不对: {len(seen)}")
         self.assertEqual(len(set(seen)), 7, "分页出现重复项")
+
+    def test_paging_when_timestamps_are_identical(self):
+        """批量导入时 created_at 全都一样，游标必须仍然不重不漏。
+
+        这条是回归测试：游标此前用 "%.6f" 编码，浮点进位会让上一页最后一条
+        重新出现在下一页（列表偶发重复），并同时漏掉一条。
+        """
+        db_path = os.environ["DB_PATH"]
+        con = store.connect(db_path)
+        for i in range(6):
+            store.insert_file(con, file_id="%032x" % (i + 1), orig_name=f"s{i}.png",
+                              stored_name=f"s{i}.png", sha=f"sha{i}", size=1,
+                              mime="image/png", width=1, height=1, thumb=0,
+                              created_at=1700000000.0)   # 故意全部相同
+        con.commit()
+        con.close()   # 必须关掉，否则 Windows 上 -shm 文件还锁着，setUp 清理会失败
+
+        seen, cursor = [], None
+        while True:
+            items, cursor, _ = store.list_files(store.connect(db_path), limit=2, cursor=cursor)
+            seen += [it["id"] for it in items]
+            if not cursor:
+                break
+        self.assertEqual(len(seen), 6, f"分页条数不对: {len(seen)}")
+        self.assertEqual(len(set(seen)), 6, f"分页出现重复/漏项: {len(set(seen))}")
 
     def test_bad_cursor_falls_back_to_first_page(self):
         self.login()

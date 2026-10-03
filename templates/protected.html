@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% block header %}{% endblock %}   {# 标题由下面的 .bar 承担，避免页面出现两个标题 #}
 {% block content %}
   <style>
     body { max-width: 1400px; }
@@ -74,7 +75,7 @@
     <span class="spacer"></span>
     <label><input type="checkbox" id="selAll" /> 全选当前页</label>
     <button id="delSel" disabled>删除选中</button>
-    <a href="{{ url_for('index') }}">去上传</a>
+    <a href="{{ url_for('upload_page') }}">去上传</a>
   </div>
 
   <div id="grid" class="grid"></div>

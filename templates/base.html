@@ -10,6 +10,8 @@
         padding: 0 20px;
         font-family: Arial, sans-serif;
       }
+      header h1 { margin-bottom: 20px; }
+      header h1:empty { display: none; }
       nav {
         margin-bottom: 20px;
       }
@@ -36,10 +38,10 @@
   </head>
   <body>
     <header>
-      <h1>上传站点</h1>
+      <h1>{% block header %}上传站点{% endblock %}</h1>
       <nav>
-        <a href="{{ url_for('index') }}">首页</a>
-        <a href="{{ url_for('protected') }}">受保护页面</a>
+        <a href="{{ url_for('upload_page') }}">上传</a>
+        <a href="{{ url_for('protected') }}">相册</a>
         {% if session.get('auth') %}
           <a href="{{ url_for('logout') }}">退出登录</a>
         {% else %}
