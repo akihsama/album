@@ -22,15 +22,39 @@
 一台设备登出不会踢掉另一台（有回归用例守着：
 `MultiDeviceTest.test_second_device_is_independent_of_first`）。
 
+按「你在不在同一个 WiFi 下」选一条路，两条**互不干涉、各自都能单独跑通**，
+默认端口也不同（局域网 5000 / 公网 5001），甚至可以同时开着：
+
+### ① 在同一个 WiFi 下 → 局域网（最快）
+
 ```bash
-pip install -r requirements.txt
-python scripts/init_password.py        # 输入口令，得到 PASSWORD_HASH
-cp .env.example .env                   # 填 SECRET_KEY / PASSWORD_HASH，设 BEHIND_TLS=0
-python scripts/serve_lan.py --qr       # ← 多终端用这个（不是直接 python app.py）
+python scripts/serve_lan.py        # 打印可点击的局域网地址，手机/另一台电脑直接开
 ```
 
-`scripts/serve_lan.py` 会打印可点击的局域网地址并按二维码，然后用
-`HOST=0.0.0.0` 拉起服务；`Ctrl+C` 收工。手机和电脑要在同一个 WiFi 下。
+`serve_lan.py` 用 `HOST=0.0.0.0` 拉起服务并打印地址，`Ctrl+C` 收工。
+- 端口被占会直接告诉你换哪个，不硬顶。
+- Windows 首次会弹防火墙提示：**允许专用网络**（不要勾公用网络）。
+
+### ② 不在同一个 WiFi（出门/异地） → 公网（加密）
+
+```bash
+python scripts/serve_public.py                    # 一条命令拿到 https 地址
+python scripts/serve_public.py --password 你的口令  # 顺便把口令设好
+```
+
+`serve_public.py` 走 **Cloudflare Tunnel**：免费、免注册、不用买域名、不用开端口映射，
+也不暴露你家 IP，并且自动签 HTTPS 证书 —— 这是硬要求：`BEHIND_TLS=1` 时会话 cookie
+带 `Secure`，只有 https 才发得出去，裸 http 上公网等于把密码明文甩在带宽里。
+- 它只把相册绑在 `127.0.0.1`，公网入口由隧道提供，本机端口不对互联网开放；
+- 首次会下载 `cloudflared` 到 `tools/`（约 50MB），之后复用；
+- Ctrl+C 只收自己拉起的那两个进程，不会误伤局域网那条路的服务。
+
+#### 固定公网地址（不想每次重启都变）
+
+免费 quick tunnel 每次地址都会变。要固定域名：`cloudflared tunnel login` 授权一次，
+然后 `cloudflared tunnel run <名字>`（在 `~/.cloudflared/config.yml` 里指向
+`http://127.0.0.1:5001`）。域名那个 `*.trycloudflare.com` 是随机的，固定名需要
+Cloudflare Zero Trust 里配一个「公共主机名」。
 
 - 直接 `python app.py` 默认只监听 `127.0.0.1`，**别的设备根本连不上**。
 - 网关口/HSTS：`SESSION_COOKIE_SECURE` 默认跟着 `BEHIND_TLS` 走，且按真实 scheme
@@ -38,7 +62,8 @@ python scripts/serve_lan.py --qr       # ← 多终端用这个（不是直接 p
   表现成"密码对了还是进不去"。
 - 多台设备共用一个出口 IP 时，登录限流按 **IP + 浏览器指纹** 分桶，
   一台输错几次不会把其余设备一起挡成 429。
-- 跨互联网访问不要裸奔 5000 端口，用 `deploy_cloudflare.sh` 或 Caddy 自动证书。
+- 长跑的正式环境（VPS / Docker）用 Caddy 自动证书：`Caddyfile` 直接
+  `reverse_proxy app:8000` 即可，别把 5000 端口裸奔出去。
 
 ## 删除功能为什么会"点不动" / 报错
 

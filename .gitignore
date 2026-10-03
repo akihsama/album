@@ -30,5 +30,14 @@ thumbs/
 # SQLite 数据目录（docker-compose 挂载点）
 data/
 
+# 公网隧道可执行文件（约 53MB，由 scripts/serve_public.py 自动下到 tools/）
+tools/
+cloudflared
+cloudflared.exe
+cloudflared*.part
+
+# 落盘/缩略图的原子写临时文件（store.py）
+*.tmp
+
 # OS files
 .DS_Store

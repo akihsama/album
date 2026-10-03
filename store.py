@@ -166,21 +166,39 @@ def delete_file(con, file_id: str):
 
 # ----- 落盘 -----
 
+def _atomic_tmp(dest_path: str) -> str:
+    """同一个目标文件被两个相册实例同时写时，各自用各自的临时文件。"""
+    dest_path = str(dest_path)
+    root, ext = os.path.splitext(dest_path)
+    return f"{root}.{os.getpid()}.{os.urandom(4).hex()}{ext}.tmp"
+
+
 def save_stream(stream, dest_path: str, chunk: int = 1 << 20) -> tuple[int, str]:
     """流式写盘 + 边写边算 SHA-256。
 
     不要 stream.read() 一次读全文件：几张大图并发就能把内存吃光。
+    先写临时文件再原子替换：本地同时跑局域网和公网两个实例时，
+    谁都不会读到对方写了一半的文件。
     """
     h = hashlib.sha256()
     size = 0
-    with open(dest_path, "wb") as f:
-        while True:
-            buf = stream.read(chunk)
-            if not buf:
-                break
-            h.update(buf)
-            size += len(buf)
-            f.write(buf)
+    tmp = _atomic_tmp(dest_path)
+    try:
+        with open(tmp, "wb") as f:
+            while True:
+                buf = stream.read(chunk)
+                if not buf:
+                    break
+                h.update(buf)
+                size += len(buf)
+                f.write(buf)
+        os.replace(tmp, dest_path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
     return size, h.hexdigest()
 
 
@@ -202,12 +220,22 @@ def make_thumbnail(src: str, dest: str) -> tuple[int, int] | None:
             elif im.mode != "RGB":
                 im = im.convert("RGB")
 
-            if THUMB_FORMAT == "webp":
-                im.save(dest, "WEBP", quality=THUMB_QUALITY, method=4)
-            elif THUMB_FORMAT == "jpeg":
-                im.save(dest, "JPEG", quality=THUMB_QUALITY, optimize=True)
-            else:
-                im.save(dest, "PNG", optimize=True)
+            # 写临时文件再换过去：两个实例同时处理同一张图也不会互相截断
+            tmp = _atomic_tmp(dest)
+            try:
+                if THUMB_FORMAT == "webp":
+                    im.save(tmp, "WEBP", quality=THUMB_QUALITY, method=4)
+                elif THUMB_FORMAT == "jpeg":
+                    im.save(tmp, "JPEG", quality=THUMB_QUALITY, optimize=True)
+                else:
+                    im.save(tmp, "PNG", optimize=True)
+                os.replace(tmp, dest)
+            except BaseException:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+                raise
             return w, h
     except Exception:
         # 缩略图失败不应该让上传失败：列表会退回显示原图
