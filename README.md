@@ -1,3 +1,34 @@
+# album — 口令登录的私人云盘
+
+单用户私有相册：上传 / 预览 / 下载 / 删除，图片自动生成缩略图。
+
+## 现在有什么
+
+- 口令用 **Argon2id** 校验（不再明文比较），登录限流 10/分钟，会话 7 天
+- 上传自动生成 **480px 缩略图**（默认 WebP，实测 55KB/张），列表只加载缩略图
+- **中文文件名完整保留** —— 磁盘用 UUID 存，真实名进 SQLite
+  （改之前 `secure_filename` 会把 `旅行 相册(1).png` 变成 `1.png`）
+- **内容去重**：落盘时算 SHA-256，同一张图传两次只占一份空间（秒传）
+- **游标分页** + 无限滚动 + 原生懒加载，几千张也能流畅滚
+- 灯箱预览：键盘 ←/→ 翻页，ESC 关闭；下载保留原始中文名
+- 路由只接受 32 位十六进制 id，路径穿越在进文件系统之前就被挡掉
+
+## 本地跑起来（不用 Docker）
+
+```bash
+pip install -r requirements.txt
+python scripts/init_password.py        # 输入口令，得到 PASSWORD_HASH
+cp .env.example .env                   # 填 SECRET_KEY / PASSWORD_HASH，设 BEHIND_TLS=0
+python app.py                          # → http://127.0.0.1:5000
+python scripts/seed_demo.py 12         # 可选：生成 12 张演示图看效果
+```
+
+`SECRET_KEY` 生成：`python -c "import secrets;print(secrets.token_hex(32))"`
+
+生产环境一律走 gunicorn（见 Dockerfile），不要 `debug=True`。
+
+---
+
 Deployment: Docker + Nginx (TLS termination)
 
 What I added

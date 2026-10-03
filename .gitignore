@@ -27,5 +27,8 @@ sessions.db
 thumbs/
 *.webp
 
+# SQLite 数据目录（docker-compose 挂载点）
+data/
+
 # OS files
 .DS_Store

@@ -11,10 +11,19 @@ services:
       # 与 nginx 的 client_max_body_size 50M 对齐
       - MAX_CONTENT_LENGTH=${MAX_CONTENT_LENGTH:-52428800}
       - UPLOAD_FOLDER=/app/uploads
+      - THUMB_FOLDER=/app/thumbs
+      - DB_PATH=/app/data/album.db
+      - THUMB_MAX=${THUMB_MAX:-480}
+      - THUMB_FORMAT=${THUMB_FORMAT:-webp}
+      - PAGE_SIZE=${PAGE_SIZE:-60}
       - BEHIND_TLS=${BEHIND_TLS:-1}
       - SESSION_LIFETIME_DAYS=${SESSION_LIFETIME_DAYS:-7}
     volumes:
       - ./uploads:/app/uploads
+      # 缩略图可随时从原图重建，但重建几千张要十几分钟，所以也持久化
+      - ./thumbs:/app/thumbs
+      # SQLite 库文件：丢了只是元数据丢失（原图还在），但中文名会变回 UUID
+      - ./data:/app/data
     expose:
       - "8000"
     networks:
