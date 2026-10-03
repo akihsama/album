@@ -10,8 +10,11 @@ quick tunnel 的好处是零配置，代价是地址每次重启都变；固定�
 一次配好，之后永远同一个地址，手机/平板/家人都能存成书签。
 
 它做了什么：
-  1. 读 .env 里的 TUNNEL_TOKEN（Cloudflare 后台给的，不用我们自己去登录授权）；
-     也可以用 TUNNEL_CRED_FILE + TUNNEL_ID（旧式 credentials-file 方式）;
+  1. 拿到隧道凭据（两种，二选一）：
+       · --setup：你从 Cloudflare 后台复制 token（token 只进 .env，不进命令行）；
+       · --init ：cloudflared 自己用浏览器登录你的 Cloudflare 账号，
+                  生成的凭据文件 + 隧道 ID 直接写进 .env，压根不用碰 token，
+                  后台那个「一次性显示」的窗口错过也不怕。
   2. 生成一份 cloudflared 配置，把 PUBLIC_HOST 这个域名指到本机 127.0.0.1;
   3. 拉起相册（只绑回环，BEHIND_TLS=1），再拉起隧道；
   4. 顺手查一下这个域名在 DNS 里有没有指到 cfargotunnel.com —— 没指过去
@@ -19,14 +22,17 @@ quick tunnel 的好处是零配置，代价是地址每次重启都变；固定�
 
 关键安全点：
   · **token 只走环境变量，绝不出现在命令行里**。命令行会被任务管理器、
-    ps aux、shell history 看见，等于把钥匙贴门上；
+    ps aux、shell history 看见，等于把钥匙贴门上；--init 这条路连 token 都不产生；
   · 这条路径依旧只把相册绑 127.0.0.1，对外入口只有隧道那一个。
 
 用法：
-    python scripts/serve_fixed.py --setup             # 第一次：填 token、生成配置、查 DNS
-    python scripts/serve_fixed.py                     # 之后每次：直接开跑
-    python scripts/serve_fixed.py --host album.example.com --port 5001
+    python scripts/serve_fixed.py --init               # 第一次：浏览器登录授权、建隧道
+    python scripts/serve_fixed.py --setup              # 或者：手动粘后台的 token
+    python scripts/serve_fixed.py --host album.example.com   # 之后每次：直接开跑
     python scripts/serve_fixed.py --check              # 只做体检，不起服务
+
+注意：固定域名这条路要求你**有自己的域名并托管在 Cloudflare**（免费域名也行），
+没有域名就只能退回 quick tunnel（地址每次重启会变）。
 """
 
 from __future__ import annotations
@@ -224,10 +230,122 @@ def run_tunnel(cf: Path, cfg: Path, env: dict[str, str] | None = None,
     return found, cf_proc
 
 
+# ------------------------------------------------------- 自己登录授权（免 token）
+
+def run_cf(cf: Path, *args: str, timeout: int = 120) -> str:
+    """跑一条 cloudflared 短命令，把输出当文本收回来。
+
+    这里不用 spawn —— spawn 是给「起完要一直管着的进程」用的，
+    login / create / list 都是命令跑完就结束，直接 run 更清楚。
+    """
+    try:
+        out = subprocess.run([str(cf), *args], capture_output=True, timeout=timeout,
+                             stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return ""
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"{e}"
+    raw = (out.stdout or b"") + (out.stderr or b"")
+    # 中文系统下 cloudflared 的部分输出是 GBK，按 utf-8 硬解会乱码/抛错
+    return raw.decode("gbk" if WINDOWS else "utf-8", errors="replace")
+
+
+def cert_path() -> Path:
+    return Path.home() / ".cloudflared" / "cert.pem"
+
+
+def list_tunnels(cf: Path) -> list[dict]:
+    """列出账号下已有隧道。返回 [] 表示没建过 / 没授权 / 解析不出来。"""
+    text = run_cf(cf, "tunnel", "list", "--output", "json", timeout=60)
+    if not text.strip():
+        return []
+    import json
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    if isinstance(data, dict):          # 出错时 cloudflared 是 {success:false,...}
+        return []
+    return [t for t in data if isinstance(t, dict) and t.get("name")]
+
+
+def login_to_cloudflare(cf: Path) -> bool:
+    """走浏览器 OAuth 登录，生成 ~/.cloudflared/cert.pem。
+
+    已经登录过就直接放过；没登录就真去跑 —— 它会自己开浏览器，
+    这一步必须人在跟前点同意，脚本没法替你点头。
+    """
+    if cert_path().exists():
+        return True
+    print("\n  · 第一次用，先让 cloudflared 登录你的 Cloudflare 账号 …")
+    print("    会弹出浏览器，选你的账号 + 授权那个域名，允许后回来就行。")
+    run_cf(cf, "tunnel", "login", timeout=180)
+    if cert_path().exists():
+        print("    ✓ 登录成功（凭据：~/.cloudflared/cert.pem）")
+        return True
+    print("\n  ✗ 登录没成功 —— 常见三个原因：")
+    print("      1. 浏览器窗口被弹到了别的虚拟桌面/没注意到；重跑一次本命令即可。")
+    print("      2. 这个账号下面没有任何托管在 Cloudflare 的域名（固定隧道必须要域名）。")
+    print("      3. 网络访问不到 Cloudflare 登录页。")
+    return False
+
+
+def ensure_tunnel(cf: Path, name: str) -> tuple[str, str] | None:
+    """保证账号里有个叫 name 的隧道，返回 (隧道ID, 凭据文件路径)。
+
+    已有的就复用（不重复建），没有就建一个。
+    凭据路径以 cloudflared 说的为准；它没打这行字时，退回 ~/.cloudflared/<id>.json。
+    """
+    tunnels = list_tunnels(cf)
+    for t in tunnels:
+        if t.get("name") == name and t.get("id"):
+            tid = str(t["id"])
+            cred = Path.home() / ".cloudflared" / f"{tid}.json"
+            if cred.exists():
+                print(f"\n  · 复用账号里已有的隧道「{name}」（ID: {tid}）")
+                return tid, str(cred)
+            # 后台有、本机没凭据：多半是在别的电脑上建过，这里只能从头走
+
+    print(f"\n  · 账号里没有可用的「{name}」隧道，建一个 …")
+    out = run_cf(cf, "tunnel", "create", name, timeout=120)
+    print("    " + (out.strip().replace("\n", "\n    ") or "(cloudflared 没给输出)")[:600])
+    # 官方输出形如：Tunnel credentials written to: C:\Users\x\.cloudflared\<id>.json
+    import re
+    # 官方输出形如：「Tunnel credentials written to: C:\Users\x\.cloudflared\xxx.json」
+    cand = None
+    m = re.search(r"written to:\s*(.+)", out, re.IGNORECASE)
+    if m:
+        p = Path(m.group(1).strip().strip('"').strip("'"))
+        if p.exists():
+            cand = p
+    if cand is None:            # 它没打这行字，就取目录里刚多出来的那个 json
+        fresh = [f for f in sorted((Path.home() / ".cloudflared").glob("*.json"))
+                 if not f.name.startswith("cert")]
+        if fresh:
+            cand = fresh[-1]
+    if cand is None:
+        print("    ✗ 没从 cloudflared 的输出里认出凭据文件，回去看上面那段输出。")
+        return None
+    tid = tunnel_id_from_cred(cand) or cand.stem
+    print(f"    ✓ 隧道 {name} 就绪（ID: {tid}）")
+    return tid, str(cand)
+
+
+def tunnel_id_from_cred(cred: Path) -> str | None:
+    """凭据文件里就存着隧道 ID —— 比猜文件名/数输出字符都靠谱。"""
+    try:
+        import json
+        return (json.loads(Path(cred).read_text(encoding="utf-8")) or {}).get("tunnel_id")
+    except Exception:
+        return None
+
+
 # --------------------------------------------------------------------- main
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="用固定域名 + 命名隧道跑相册")
+    ap.add_argument("--init", action="store_true",
+                    help="不碰 token：浏览器登录 Cloudflare、自动建隧道，凭据写进 .env")
     ap.add_argument("--setup", action="store_true", help="第一次配置：填 token、生成配置、查 DNS")
     ap.add_argument("--check", action="store_true", help="只体检（token/配置/DNS），不起服务")
     ap.add_argument("--host", help="你的固定域名，如 album.example.com")
@@ -252,14 +370,49 @@ def main() -> int:
     cred_file = saved.get("TUNNEL_CRED_FILE") or None
     tunnel_id = saved.get("TUNNEL_ID") or None
 
-    if args.check and token and not args.setup:
+    if args.check and not args.setup and not args.init:
         # --check 只体检：连 .env 里的配置一并确认一遍，不碰服务
+        what = ("token（长度 %d，来源 %s）" % (len(token), "命令行 --token" if args.token else ".env")
+                if token else
+                f"凭据文件 {cred_file}" if cred_file else "什么都没有")
         bad = check_host(host)
-        print("\n  · token 已就位（长度 %d，来源：%s）"
-              % (len(token), "命令行 --token" if args.token else ".env"))
+        print(f"\n  · 隧道凭据已就位：{what}")
         return 1 if bad else 0
 
-    # 2) --setup：把 token 存进 .env，生成配置，做 DNS 体检
+    # 2) --init：自己登录授权 + 建隧道，全程不产生也不碰 token
+    if args.init:
+        cf_exe = find_cloudflared()
+        if cf_exe is None:
+            print("\n✗ 没找到 cloudflared。先跑一次 python scripts/serve_public.py，"
+                  "它会下载一个到 tools/，之后两条路共用。")
+            return 2
+        if not login_to_cloudflare(cf_exe):
+            return 2
+        got = ensure_tunnel(cf_exe, name)
+        if got is None:
+            print("\n✗ 隧道没准备好，回去看上面的报错。")
+            return 2
+        tid, cred = got
+        if not host:
+            host = input("\n  固定域名（自己托管的，如 album.example.com）：").strip()
+        if not host:
+            print("\n✗ 固定域名不能为空 —— 没有域名就没法固定地址。")
+            return 2
+        write_env({"TUNNEL_ID": tid, "TUNNEL_CRED_FILE": cred,
+                   "TUNNEL_NAME": name, "PUBLIC_HOST": host})
+        print(f"\n  · 已写入 .env：隧道 {name}（{tid}）+ 固定域名 {host}")
+        print("  · 凭据文件不走 token —— 命令行、屏幕、进程列表里都留不下它。")
+        print("\n  还差最后一步（必须在后台点一下，脚本没法替你注册 DNS）：")
+        print("    Cloudflare 后台 → 选你的域名 → DNS 记录：加一条")
+        print(f"      类型 CNAME｜名称 album｜目标 {tid}.cfargotunnel.com")
+        print("    （或者 Zero Trust → Networks → Tunnels → album → Public hostname → Add，")
+        print("      填 album.你的域名.com，Service 选 HTTP、URL 填 http://localhost:5001）")
+        print("\n  配好 DNS 之后，以后只要跑：")
+        print("    python scripts/serve_fixed.py        → https://" + host)
+        print("    python scripts/serve_fixed.py --check → 只体检")
+        return 0
+
+    # 3) --setup：把 token 存进 .env，生成配置，做 DNS 体检
     if args.setup:
         if not token:
             print("\n  在 Cloudflare 后台拿 token：")

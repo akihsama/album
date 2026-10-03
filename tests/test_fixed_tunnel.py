@@ -305,6 +305,158 @@ class MainFlowTest(unittest.TestCase):
         self.assertEqual(app_calls[0]["port"], 5001)
 
 
+class SelfAuthSetupTest(unittest.TestCase):
+    """--init 这条路：cloudflared 自己登录授权，全程不产生也不碰 token。
+
+    tearDown 是这道路的闸门：以前有用例把桩打在 SC.write_env 上（serve_fixed
+    里是 `from serve_common import write_env`，打函数等于没打），假隧道配置就这么
+    落进了仓库的真 .env。每条用例收工都查一遍，别再犯。
+    """
+
+    FORBIDDEN = ("TUNNEL_TOKEN", "TUNNEL_ID", "TUNNEL_CRED_FILE", "TUNNEL_NAME",
+                 "PUBLIC_HOST")
+
+    def tearDown(self):
+        real_env = ROOT / ".env"
+        if not real_env.exists():
+            return
+        body = real_env.read_text(encoding="utf-8")
+        for key in self.FORBIDDEN:
+            self.assertNotIn(
+                key + "=", body,
+                f"仓库的 .env 里冒出了 {key} —— 八成是某条用例的桩打错了地方")
+
+
+    @staticmethod
+    def _sandbox(tmp: Path, cred_name="uuid-1111", body=None):
+        """造一个假的 ~/.cloudflared：cert.pem + 一个凭据 json。"""
+        home = tmp / "home"
+        (home / ".cloudflared").mkdir(parents=True, exist_ok=True)
+        (home / ".cloudflared" / "cert.pem").write_text("cert", encoding="utf-8")
+        cred = home / ".cloudflared" / f"{cred_name}.json"
+        if body is None:
+            body = {"tunnel_id": cred_name, "AccountTag": "acct"}
+        cred.write_text(__import__("json").dumps(body), encoding="utf-8")
+        return home, cred
+
+    def test_tunnel_id_comes_from_credential_file(self):
+        """隧道 ID 从凭据内容里读 —— 比猜文件名/数输出字符可靠。"""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            _, cred = self._sandbox(Path(d), "abc-123", {"tunnel_id": "abc-123"})
+            self.assertEqual(F.tunnel_id_from_cred(cred), "abc-123")
+
+    def test_tunnel_id_returns_none_on_garbage(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            _, cred = self._sandbox(Path(d), "x", {"tunnel_id": "x"})
+            cred.write_text("这不是 json", encoding="utf-8")
+            self.assertIsNone(F.tunnel_id_from_cred(cred))
+
+    def test_list_tunnels_parses_json(self):
+        with mock.patch.object(F, "run_cf", return_value='[{"id":"u1","name":"album"}]'):
+            self.assertEqual(F.list_tunnels(Path("cf.exe")), [{"id": "u1", "name": "album"}])
+
+    def test_list_tunnels_survives_garbage_output(self):
+        """cloudflared 没登录时会吐一堆报错文本 —— 不能让解析把测试炸了。"""
+        with mock.patch.object(F, "run_cf", return_value="You are not logged in\n"):
+            self.assertEqual(F.list_tunnels(Path("cf.exe")), [])
+
+    def test_reuses_existing_tunnel_without_creating(self):
+        """后台已经有同名隧道就必须复用 —— 重复 create 会在账号里留一堆孤儿隧道。"""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            home, cred = self._sandbox(Path(d), "uuid-reuse")
+            with mock.patch.object(F, "list_tunnels",
+                                   return_value=[{"id": "uuid-reuse", "name": "album"}]), \
+                    mock.patch.object(Path, "home", return_value=home), \
+                    mock.patch.object(F, "run_cf") as rc:
+                got = F.ensure_tunnel(Path("cf.exe"), "album")
+            self.assertEqual(got, ("uuid-reuse", str(cred)))
+            rc.assert_not_called()
+
+    def test_creates_and_picks_up_credential_path(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            home, cred = self._sandbox(Path(d), "uuid-new")
+            out = f"Tunnel credentials written to: {cred}\nTunnel album created\n"
+            with mock.patch.object(F, "list_tunnels", return_value=[]), \
+                    mock.patch.object(Path, "home", return_value=home), \
+                    mock.patch.object(F, "run_cf", return_value=out) as rc:
+                got = F.ensure_tunnel(Path("cf.exe"), "album")
+            self.assertEqual(got, ("uuid-new", str(cred)))
+            self.assertIn("create", rc.call_args[0])
+
+    def test_init_writes_cred_env_and_never_touches_token(self):
+        """--init 收尾：写 TUNNEL_ID / TUNNEL_CRED_FILE，屏幕上不冒任何凭据。"""
+        import tempfile
+
+        class _No:
+            """拦住 .env 写入，确认 --init 只走凭据这条路。"""
+
+            def __init__(self, path):
+                self.path = path
+
+        env_file = Path(tempfile.mkdtemp()) / ".env"
+        # 桩点选 SC.ENV_PATH 而不是 SC.write_env：serve_fixed 里写的是
+        # `from serve_common import write_env`，只桩函数等于没桩
+        buf = io.StringIO()
+        with mock.patch.object(F, "find_cloudflared", return_value=Path("cf.exe")), \
+                mock.patch.object(F, "login_to_cloudflare", return_value=True), \
+                mock.patch.object(F, "ensure_tunnel",
+                                  return_value=("uuid-init", "C:/Users/x/.cloudflared/uuid-init.json")), \
+                mock.patch.object(SC, "ENV_PATH", env_file), \
+                mock.patch.object(F, "input", lambda *a: "album.example.com"), \
+                mock.patch.object(F, "ensure_env"), \
+                mock.patch.object(sys, "argv", ["serve_fixed.py", "--init"]), \
+                mock.patch.dict(os.environ, {}, clear=True):
+            with contextlib.redirect_stdout(buf):
+                rc = F.main()
+        self.assertEqual(rc, 0)
+        body = env_file.read_text(encoding="utf-8")
+        self.assertIn("TUNNEL_ID=uuid-init", body)
+        self.assertIn("TUNNEL_CRED_FILE=C:/Users/x/.cloudflared/uuid-init.json", body)
+        self.assertIn("PUBLIC_HOST=album.example.com", body)
+        self.assertNotIn("TUNNEL_TOKEN", body, "--init 不该去动 token")
+        # 隧道 ID 该上屏（后台配 CNAME 要用它），但完整凭据路径不该被回显
+        self.assertNotIn("C:/Users/x/.cloudflared/uuid-init.json", buf.getvalue())
+        # 关键是「差一步没配」要说清楚，别让人对着打不开的地址猜
+        self.assertIn("CNAME", buf.getvalue())
+
+    def test_init_aborts_when_login_fails(self):
+        """登录没成就别往下走 —— 硬着头皮建隧道只会得到一个连不上的隧道。"""
+        buf = io.StringIO()
+        with mock.patch.object(F, "find_cloudflared", return_value=Path("cf.exe")), \
+                mock.patch.object(F, "login_to_cloudflare", return_value=False), \
+                mock.patch.object(F, "ensure_env"), \
+                mock.patch.object(SC, "ENV_PATH", Path(tempfile.mkdtemp()) / ".env"), \
+                mock.patch.object(sys, "argv", ["serve_fixed.py", "--init"]), \
+                mock.patch.dict(os.environ, {}, clear=True):
+            with contextlib.redirect_stdout(buf):
+                rc = F.main()
+        self.assertEqual(rc, 2)
+
+    def test_init_never_starts_a_tunnel(self):
+        """:--init 是配环境的，不是开服务的 —— 起服务留给下一行命令。"""
+        with mock.patch.object(F, "find_cloudflared", return_value=Path("cf.exe")), \
+                mock.patch.object(F, "login_to_cloudflare", return_value=True), \
+                mock.patch.object(F, "ensure_tunnel",
+                                  return_value=("uuid-x", "C:/x.json")), \
+                mock.patch.object(F, "input", lambda *a: "album.example.com"), \
+                mock.patch.object(F, "ensure_env"), \
+                mock.patch.object(SC, "ENV_PATH", Path(tempfile.mkdtemp()) / ".env"), \
+                mock.patch.object(F, "spawn") as sp, \
+                mock.patch.object(sys, "argv", ["serve_fixed.py", "--init"]), \
+                mock.patch.dict(os.environ, {}, clear=True):
+            with contextlib.redirect_stdout(io.StringIO()):
+                F.main()
+        self.assertEqual(sp.call_count, 0, "--init 不该拉起任何进程")
+
+
 class SharedCloudflaredTest(unittest.TestCase):
     """两条路共用同一个 cloudflared 查找，别各找各的。"""
 

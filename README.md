@@ -53,14 +53,33 @@ python scripts/serve_public.py --password 你的口令  # 顺便把口令设好
 
 免费 quick tunnel 每次重启地址都会变（`*.trycloudflare.com` 是随机的）。要「永远是同一个
 网址」得用 **Cloudflare 命名隧道 + 你自己的域名**，这一步只做一次，交给
-`scripts/serve_fixed.py`：
+`scripts/serve_fixed.py`。两种方式任选其一：
+
+**A. 不想碰 token（推荐）** —— `cloudflared` 自己用浏览器登录你的 Cloudflare 账号：
+
+```bash
+python scripts/serve_fixed.py --init
+```
+
+1. 脚本自己弹浏览器让你登录、授权域名（只做一次，凭据存 `~/.cloudflared/cert.pem`）；
+2. 自动检查账号里有没有叫 `album` 的隧道，有就复用、没有才建（不会留一堆孤儿隧道）；
+3. 把**隧道 ID + 凭据文件路径**写进 `.env` —— 这条路**根本不产生 token**，
+   Cloudflare 后台那个「只显示一次」的窗口错过也不怕；
+4. 告诉你后台还差哪一步（加一条 CNAME / Public hostname），配好 DNS 就好。
+
+**B. 手动从后台复制 token**：
 
 ```bash
 python scripts/serve_fixed.py --setup --host album.你的域名.com
 ```
 
+> token 在后台的位置（忘了只能在这儿找回来）：
+> [dash.cloudflare.com](https://dash.cloudflare.com/) → **Networking → Tunnels**
+> → 点你的隧道 → **Add a replica**（或 Edit）→ 复制那条 `cloudflared tunnel run --token **eyJ...**`
+> 安装命令里 `eyJ` 开头的一长串。**创建时只显示一次，错过就只能从这里再取。**
+
 它干什么：
-1. 让你粘 Cloudflare 给的隧道 token（**不回显**，只写进 `.env`）；
+1. （方式 A 已代劳）拿到隧道凭据：token 方式让你粘过来（**不回显**，只写进 `.env`）；
 2. 在 `tools/tunnel-album.yml` 里生成一份 cloudflared 配置（域名 → `127.0.0.1:5001`，
    最后带 `http_status:404` 兜底，缺这条 cloudflared 拒绝启动）；
 3. 查一次 DNS：这个域名在 CNAME 里有没有指向 `<隧道ID>.cfargotunnel.com`。
@@ -78,8 +97,12 @@ python scripts/serve_fixed.py --port 6001          # 端口换一个
   并且同样只绑 `127.0.0.1`，公网入口只有隧道那一个。
 - **token 只走环境变量**，不出现在任何命令行里（命令行会被任务管理器、`ps`、
   shell history 看见，等于把钥匙贴门上）；`--setup` 后也不往屏幕上回显。
+  用 `--init` 就完全绕开 token。
+- `tunnel list --output json` 已内置：换台电脑配时，能认出同账号里已有的隧道直接复用。
 - 换域名/换隧道：`--setup` 重跑一次即可，token 会就地更新。
 - 还没域名？先买一个（最便宜的 .com/.xyz 一年几十块），或者继续用 quick tunnel。
+- 固定域名这条路**必须有自己托管在 Cloudflare 的域名**；没有就只能回到 quick tunnel
+  （地址会变）。`--init` 里登录失败最常见的就是这个原因。
 
 - 直接 `python app.py` 默认只监听 `127.0.0.1`，**别的设备根本连不上**。
 - 网关口/HSTS：`SESSION_COOKIE_SECURE` 默认跟着 `BEHIND_TLS` 走，且按真实 scheme
