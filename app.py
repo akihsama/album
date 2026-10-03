@@ -1,5 +1,6 @@
 import logging
 import os
+import threading
 import uuid
 import secrets
 from datetime import timedelta
@@ -7,32 +8,56 @@ from functools import wraps
 
 from flask import (
     Flask,
+    g,
+    jsonify,
     request,
     redirect,
     url_for,
     render_template,
     flash,
-    send_from_directory,
+    send_file,
     session,
     abort,
 )
-from werkzeug.utils import secure_filename
 from werkzeug.middleware.proxy_fix import ProxyFix
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHash, VerificationError, VerifyMismatchError
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
+import store
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("album")
 
 
+def _load_dotenv():
+    """零依赖读取 .env：只填充尚未设置的环境变量，已存在的（含容器注入）优先。"""
+    path = os.environ.get("ENV_FILE", ".env")
+    if not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+
+
+_load_dotenv()
+
+
 # ----- 配置：关键项缺失就拒绝启动，绝不静默降级 -----
 UPLOAD_FOLDER = os.environ.get("UPLOAD_FOLDER", "uploads")
-ALLOWED_EXTENSIONS = {"txt", "pdf", "png", "jpg", "jpeg", "gif", "zip", "csv"}
-IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "gif"}
+THUMB_FOLDER = os.environ.get("THUMB_FOLDER", "thumbs")
+DB_PATH = os.environ.get("DB_PATH", os.path.join(UPLOAD_FOLDER, "album.db"))
+ALLOWED_EXTENSIONS = {"txt", "pdf", "png", "jpg", "jpeg", "gif", "webp", "zip", "csv"}
 # 默认与 nginx 的 client_max_body_size 50M 对齐，避免"收完了才被拒"
 MAX_CONTENT_LENGTH = int(os.environ.get("MAX_CONTENT_LENGTH", 50 * 1024 * 1024))
+PAGE_SIZE = int(os.environ.get("PAGE_SIZE", "60"))
+# 私人云盘默认不允许匿名上传；要恢复旧行为设 ALLOW_ANONYMOUS_UPLOAD=1
+ALLOW_ANONYMOUS_UPLOAD = os.environ.get("ALLOW_ANONYMOUS_UPLOAD", "0") == "1"
 
 SECRET_KEY = os.environ.get("SECRET_KEY")
 if not SECRET_KEY:
@@ -48,6 +73,7 @@ SESSION_LIFETIME_DAYS = int(os.environ.get("SESSION_LIFETIME_DAYS", "7"))
 
 app = Flask(__name__)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+app.config["THUMB_FOLDER"] = THUMB_FOLDER
 app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
 app.secret_key = SECRET_KEY
 
@@ -69,8 +95,27 @@ limiter = Limiter(
 )
 
 os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
+os.makedirs(app.config["THUMB_FOLDER"], exist_ok=True)
 
 _ph = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=4)
+
+# 限制同时生成缩略图的线程数：4000x3000 解码后 ~36MB RGB，加上 resize 缓冲，
+# 单张峰值能到几百 MB。小内存机器上并发几张就会撑爆。
+_thumb_sem = threading.Semaphore(int(os.environ.get("THUMB_CONCURRENCY", "2")))
+
+
+# ----- 数据库（每请求一连接）-----
+def get_db():
+    if "db" not in g:
+        g.db = store.connect(DB_PATH)
+    return g.db
+
+
+@app.teardown_appcontext
+def close_db(exc=None):
+    db = g.pop("db", None)
+    if db is not None:
+        db.close()
 
 
 # ----- 工具函数 -----
@@ -83,11 +128,7 @@ def verify_password(pwd: str) -> bool:
 
 
 def allowed_file(filename):
-    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
-
-
-def is_image(filename):
-    return "." in filename and filename.rsplit(".", 1)[1].lower() in IMAGE_EXTENSIONS
+    return "." in filename and store.ext_of(filename) in ALLOWED_EXTENSIONS
 
 
 def login_required(f):
@@ -106,12 +147,79 @@ def ensure_csrf():
     return session["csrf_token"]
 
 
+def check_csrf_json() -> bool:
+    """fetch 请求从 header 取 token，避免把 token 拼在 URL 里。"""
+    token = request.headers.get("X-CSRFToken") or request.form.get("csrf_token")
+    return bool(token) and token == session.get("csrf_token")
+
+
+def _safe_id(file_id: str) -> bool:
+    return len(file_id) == 32 and all(c in "0123456789abcdef" for c in file_id)
+
+
 @app.after_request
 def security_headers(resp):
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
     resp.headers.setdefault("Referrer-Policy", "no-referrer")
     resp.headers.setdefault("X-Frame-Options", "DENY")
     return resp
+
+
+# ----- 上传落库 -----
+def ingest(file) -> tuple[str, str]:
+    """返回 (状态, 展示名)。状态：saved / dup / skipped / failed"""
+    orig = os.path.basename(file.filename or "")
+    if not orig or not allowed_file(orig):
+        return "skipped", orig
+
+    ext = store.ext_of(orig)
+    tmp = os.path.join(app.config["UPLOAD_FOLDER"], f".tmp_{uuid.uuid4().hex}")
+    try:
+        size, sha = store.save_stream(file.stream, tmp)
+    except Exception as e:
+        log.warning("写入失败 %s: %s", orig, e)
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        return "failed", orig
+
+    con = get_db()
+    hit = store.find_by_sha(con, sha)
+    if hit:
+        # 秒传：内容完全一致，不占第二份磁盘
+        os.remove(tmp)
+        log.info("秒传命中 %s -> %s", orig, hit["id"])
+        return "dup", orig
+
+    file_id = store.new_id()
+    stored = f"{file_id}.{ext}"
+    final = os.path.join(app.config["UPLOAD_FOLDER"], stored)
+    os.replace(tmp, final)
+
+    width = height = None
+    has_thumb = 0
+    if store.is_image(orig):
+        with _thumb_sem:
+            dims = store.make_thumbnail(final, os.path.join(app.config["THUMB_FOLDER"], store.thumb_name(file_id)))
+        if dims:
+            width, height = dims
+            has_thumb = 1
+        else:
+            log.warning("缩略图生成失败 %s", orig)
+
+    store.insert_file(
+        con,
+        file_id=file_id,
+        orig_name=orig,
+        stored_name=stored,
+        sha=sha,
+        size=size,
+        mime=store.mime_of(orig),
+        width=width,
+        height=height,
+        thumb=has_thumb,
+        created_at=os.path.getmtime(final),
+    )
+    return "saved", orig
 
 
 # ----- 路由 -----
@@ -124,14 +232,11 @@ def index():
 @app.route("/upload", methods=["POST"])
 @limiter.limit("60/minute")
 def upload():
-    # Optional CSRF check even for anonymous uploads
+    if not ALLOW_ANONYMOUS_UPLOAD and not session.get("auth"):
+        return redirect(url_for("login", next=request.path))
     form_csrf = request.form.get("csrf_token")
     if not form_csrf or form_csrf != session.get("csrf_token"):
         flash("无效的请求（CSRF 检测失败）", "error")
-        return redirect(url_for("index"))
-
-    if "files" not in request.files:
-        flash("未检测到文件字段", "error")
         return redirect(url_for("index"))
 
     files = request.files.getlist("files")
@@ -139,19 +244,22 @@ def upload():
         flash("未选择文件", "error")
         return redirect(url_for("index"))
 
-    saved = []
+    saved, dup, skipped, failed = [], [], [], []
     for file in files:
-        if file and file.filename and allowed_file(file.filename):
-            filename = secure_filename(file.filename)
-            unique_name = f"{uuid.uuid4().hex}_{filename}"
-            save_path = os.path.join(app.config["UPLOAD_FOLDER"], unique_name)
-            file.save(save_path)
-            saved.append(filename)
+        if not file or not file.filename:
+            continue
+        status, name = ingest(file)
+        {"saved": saved, "dup": dup, "skipped": skipped, "failed": failed}[status].append(name)
+
     if saved:
-        flash(f"已上传: {', '.join(saved)}", "success")
-    else:
-        flash("没有可上传的文件（可能是不支持的类型）", "error")
-    return redirect(url_for("index"))
+        flash(f"已上传 {len(saved)} 个：{', '.join(saved[:5])}{'…' if len(saved) > 5 else ''}", "success")
+    if dup:
+        flash(f"{len(dup)} 个内容重复，已秒传不占空间：{', '.join(dup[:5])}", "info")
+    if skipped:
+        flash(f"{len(skipped)} 个被跳过（不支持的类型）", "error")
+    if failed:
+        flash(f"{len(failed)} 个写入失败，请查看日志", "error")
+    return redirect(url_for("protected"))
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -186,69 +294,96 @@ def logout():
 @login_required
 def protected():
     ensure_csrf()
-    raw_files = sorted(os.listdir(app.config["UPLOAD_FOLDER"]))
-    files = []
-    for fn in raw_files:
-        display = fn
-        if "_" in fn:
-            # display original name after the first underscore
-            parts = fn.split("_", 1)
-            display = parts[1]
-        files.append({"saved_name": fn, "display_name": display, "is_image": is_image(fn)})
-    return render_template("protected.html", files=files)
+    total = get_db().execute("SELECT COUNT(*) FROM files").fetchone()[0]
+    return render_template("protected.html", total=total, page_size=PAGE_SIZE,
+                           csrf=session["csrf_token"], has_pil=store.HAS_PIL)
 
 
-@app.route("/uploads/<path:filename>")
+@app.route("/api/files")
 @login_required
-def uploaded_file(filename):
-    # Only allow filenames that are exact matches in the upload folder
-    safe_name = secure_filename(filename)
-    if safe_name != filename:
-        abort(404)
-    return send_from_directory(app.config["UPLOAD_FOLDER"], safe_name, as_attachment=True)
-
-
-@app.route("/preview/<path:filename>")
-@login_required
-def preview(filename):
-    # only preview image types
-    safe_name = secure_filename(filename)
-    if safe_name != filename or not is_image(filename):
-        abort(404)
-    # send file to be displayed inline by the browser
-    return send_from_directory(app.config["UPLOAD_FOLDER"], safe_name)
-
-
-@app.route("/delete", methods=["POST"])
-@login_required
-def delete_file():
-    form_csrf = request.form.get("csrf_token")
-    if not form_csrf or form_csrf != session.get("csrf_token"):
-        flash("无效的请求（CSRF 检测失败）", "error")
-        return redirect(url_for("protected"))
-
-    filename = request.form.get("filename")
-    if not filename:
-        flash("未指定要删除的文件", "error")
-        return redirect(url_for("protected"))
-
-    safe_name = secure_filename(filename)
-    if safe_name != filename:
-        flash("无效的文件名", "error")
-        return redirect(url_for("protected"))
-
-    path = os.path.join(app.config["UPLOAD_FOLDER"], safe_name)
-    if not os.path.exists(path):
-        flash("文件不存在", "error")
-        return redirect(url_for("protected"))
-
+def api_files():
+    """游标分页。第一屏随页面渲染，后续由前端无限滚动拉取。"""
     try:
-        os.remove(path)
-        flash(f"已删除: {safe_name}", "success")
-    except Exception as e:
-        flash(f"删除失败: {e}", "error")
+        limit = min(int(request.args.get("limit", PAGE_SIZE)), 200)
+    except ValueError:
+        limit = PAGE_SIZE
+    items, next_cursor, total = store.list_files(get_db(), limit=limit, cursor=request.args.get("cursor"))
+    return jsonify({"items": items, "next_cursor": next_cursor, "total": total})
 
-    return redirect(url_for("protected"))
+
+@app.route("/thumb/<file_id>")
+@login_required
+def thumb(file_id):
+    if not _safe_id(file_id):
+        abort(404)
+    row = store.get_file(get_db(), file_id)
+    if not row or not row["thumb"]:
+        abort(404)
+    path = os.path.join(app.config["THUMB_FOLDER"], store.thumb_name(file_id))
+    if not os.path.exists(path):
+        abort(404)
+    # 缩略图是内容寻址的静态产物，可以放心缓存
+    return send_file(path, mimetype=f"image/{store.THUMB_FORMAT}", max_age=86400)
+
+
+@app.route("/preview/<file_id>")
+@login_required
+def preview(file_id):
+    if not _safe_id(file_id):
+        abort(404)
+    row = store.get_file(get_db(), file_id)
+    if not row or not store.is_image(row["orig_name"]):
+        abort(404)
+    return send_file(os.path.join(app.config["UPLOAD_FOLDER"], row["stored_name"]),
+                     mimetype=row["mime"])
+
+
+@app.route("/download/<file_id>")
+@login_required
+def download(file_id):
+    if not _safe_id(file_id):
+        abort(404)
+    row = store.get_file(get_db(), file_id)
+    if not row:
+        abort(404)
+    # download_name 保留原始中文名，Flask 会按 RFC 5987 编码
+    return send_file(os.path.join(app.config["UPLOAD_FOLDER"], row["stored_name"]),
+                     mimetype=row["mime"], as_attachment=True, download_name=row["orig_name"])
+
+
+@app.route("/api/delete", methods=["POST"])
+@login_required
+def api_delete():
+    if not check_csrf_json():
+        return jsonify({"ok": False, "error": "CSRF 校验失败"}), 403
+
+    payload = request.get_json(silent=True) or {}
+    ids = payload.get("ids") or ([payload["id"]] if payload.get("id") else [])
+    if not ids:
+        return jsonify({"ok": False, "error": "未指定文件"}), 400
+
+    con = get_db()
+    removed = []
+    for file_id in ids:
+        if not _safe_id(file_id):
+            continue
+        row = store.get_file(con, file_id)
+        if not row:
+            continue
+        for p in (
+            os.path.join(app.config["UPLOAD_FOLDER"], row["stored_name"]),
+            os.path.join(app.config["THUMB_FOLDER"], store.thumb_name(file_id)),
+        ):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except OSError as e:
+                log.warning("删除失败 %s: %s", p, e)
+        store.delete_file(con, file_id)
+        removed.append(file_id)
+
+    log.info("删除 %d 个文件", len(removed))
+    return jsonify({"ok": True, "removed": removed})
 
 
 @app.errorhandler(413)
