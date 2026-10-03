@@ -31,7 +31,6 @@ import json
 import os
 import queue
 import re
-import shutil
 import subprocess
 import sys
 import threading
@@ -42,7 +41,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from serve_common import (  # noqa: E402
-    ROOT, ensure_env, pick_port, port_busy, spawn, spawn_app, stop, wait_health,
+    ROOT, ensure_env, find_cloudflared, pick_port, port_busy, spawn, spawn_app, stop, wait_health,
 )
 
 WINDOWS = sys.platform.startswith("win")
@@ -106,25 +105,6 @@ def download_cloudflared(dest: Path) -> Path:
     if not WINDOWS:
         dest.chmod(0o755)
     return dest
-
-
-def find_cloudflared() -> Path | None:
-    """按顺序找：环境变量 → PATH → 常用目录 → tools/。"""
-    if os.environ.get("CLOUDFLARED"):
-        p = Path(os.environ["CLOUDFLARED"])
-        if p.exists():
-            return p
-    hit = shutil.which("cloudflared")
-    if hit:
-        return Path(hit)
-    exe = "cloudflared.exe" if WINDOWS else "cloudflared"
-    for c in (ROOT / "tools" / exe,
-              Path.home() / ".cloudflared" / exe,
-              Path.home() / "AppData" / "Local" / "Programs" / "Cloudflare Tunnel" / exe,
-              ROOT / exe):
-        if c.exists():
-            return c
-    return None
 
 
 def grab_tunnel_url(proc: subprocess.Popen, timeout: int = 60, verbose: bool = False) -> str:

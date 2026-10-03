@@ -51,10 +51,35 @@ python scripts/serve_public.py --password 你的口令  # 顺便把口令设好
 
 #### 固定公网地址（不想每次重启都变）
 
-免费 quick tunnel 每次地址都会变。要固定域名：`cloudflared tunnel login` 授权一次，
-然后 `cloudflared tunnel run <名字>`（在 `~/.cloudflared/config.yml` 里指向
-`http://127.0.0.1:5001`）。域名那个 `*.trycloudflare.com` 是随机的，固定名需要
-Cloudflare Zero Trust 里配一个「公共主机名」。
+免费 quick tunnel 每次重启地址都会变（`*.trycloudflare.com` 是随机的）。要「永远是同一个
+网址」得用 **Cloudflare 命名隧道 + 你自己的域名**，这一步只做一次，交给
+`scripts/serve_fixed.py`：
+
+```bash
+python scripts/serve_fixed.py --setup --host album.你的域名.com
+```
+
+它干什么：
+1. 让你粘 Cloudflare 给的隧道 token（**不回显**，只写进 `.env`）；
+2. 在 `tools/tunnel-album.yml` 里生成一份 cloudflared 配置（域名 → `127.0.0.1:5001`，
+   最后带 `http_status:404` 兜底，缺这条 cloudflared 拒绝启动）；
+3. 查一次 DNS：这个域名在 CNAME 里有没有指向 `<隧道ID>.cfargotunnel.com`。
+   没指过去会直接告诉你「后台还没配好」去哪个菜单配，而不是让你对着打不开的地址猜。
+
+之后每次启动就是一行：
+
+```bash
+python scripts/serve_fixed.py                      # https://album.你的域名.com
+python scripts/serve_fixed.py --check              # 只体检（配置/DNS），不起服务
+python scripts/serve_fixed.py --port 6001          # 端口换一个
+```
+
+- 三条路默认端口分开（局域网 5000 / quick 公网本机侧 5001 / 固定域名 5001），
+  并且同样只绑 `127.0.0.1`，公网入口只有隧道那一个。
+- **token 只走环境变量**，不出现在任何命令行里（命令行会被任务管理器、`ps`、
+  shell history 看见，等于把钥匙贴门上）；`--setup` 后也不往屏幕上回显。
+- 换域名/换隧道：`--setup` 重跑一次即可，token 会就地更新。
+- 还没域名？先买一个（最便宜的 .com/.xyz 一年几十块），或者继续用 quick tunnel。
 
 - 直接 `python app.py` 默认只监听 `127.0.0.1`，**别的设备根本连不上**。
 - 网关口/HSTS：`SESSION_COOKIE_SECURE` 默认跟着 `BEHIND_TLS` 走，且按真实 scheme

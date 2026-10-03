@@ -201,12 +201,25 @@ class FindCloudflaredTest(unittest.TestCase):
             self.assertEqual(SP.find_cloudflared(), fake)
 
     def test_ignores_env_var_pointing_to_missing_file(self):
-        """指向不存在的文件 ≠ 找到了；候选目录也空时老实返回 None（让脚本去下载）。"""
+        """指向不存在的文件 ≠ 找到了；候选目录也空时老实返回 None（让脚本去下载）。
+
+        查找逻辑在 serve_common 里（两条路共用），所以桩它的 shutil 而不是 serve_public 的 ——
+        后者现在压根不碰 shutil，桩一个不存在的模块属性只会拿 AttributeError。
+        """
         empty = Path(tempfile.mkdtemp())
         with mock.patch.dict(os.environ, {"CLOUDFLARED": str(empty / "no-such.exe")}), \
-                mock.patch.object(SP.shutil, "which", return_value=None), \
-                mock.patch.object(SP, "ROOT", empty):
-            self.assertIsNone(SP.find_cloudflared())
+                mock.patch.object(SC.shutil, "which", return_value=None), \
+                mock.patch.object(SC, "ROOT", empty):
+            self.assertIsNone(SC.find_cloudflared())
+
+    def test_public_reuses_common_finder(self):
+        """serve_public 别再复制一份查找 —— 改一处另一处还按旧路径找。
+
+        用 is 判身份而不是看返回值：两边都 from ... import 的写法下，
+        patch 住 serve_common 的也改不到已导入的引用，只有"是不是同一个函数"才测得出。
+        """
+        self.assertIs(SC.find_cloudflared, SP.find_cloudflared,
+                      "serve_public 自己又抄了一份 cloudflared 查找")
 
 
 if __name__ == "__main__":

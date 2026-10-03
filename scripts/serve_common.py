@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -80,6 +81,35 @@ def ensure_env(need_password: bool = False, password: str | None = None) -> None
 
         write_env({"SECRET_KEY": secrets.token_urlsafe(32)})
         print("  · .env 缺 SECRET_KEY，已补一个随机值（会话签名靠它，别再删）")
+
+
+# --------------------------------------------------------------------- cloudflared
+
+def find_cloudflared() -> Path | None:
+    """按顺序找 cloudflared：环境变量 → PATH → 常用目录 → tools/。
+
+    两条路（quick tunnel / 固定域名）都用同一个查找结果，
+    免得一份逻辑复制两遍、改了一处另一处还按旧路径找。
+    """
+    if os.environ.get("CLOUDFLARED"):
+        p = Path(os.environ["CLOUDFLARED"])
+        if p.exists():
+            return p
+    hit = shutil.which("cloudflared")
+    if hit:
+        return Path(hit)
+    exe = "cloudflared.exe" if WINDOWS else "cloudflared"
+    try:
+        home = Path.home()
+    except (RuntimeError, OSError):
+        home = None          # 容器/挂了 HOME 的环境下不强求
+    for c in (ROOT / "tools" / exe,
+              home / ".cloudflared" / exe if home else None,
+              home / "AppData" / "Local" / "Programs" / "Cloudflare Tunnel" / exe if home else None,
+              ROOT / exe):
+        if c is not None and c.exists():
+            return c
+    return None
 
 
 # --------------------------------------------------------------------- 端口
